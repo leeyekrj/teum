@@ -1,0 +1,64 @@
+import Foundation
+
+/// Work and personal (#8): a named set of accounts — one Claude Code
+/// sign-in and one Codex account. The profile in use decides which account
+/// the Claude and Codex cards read, and with them the menu bar, the island,
+/// the dock and the desktop cards. Choosing one changes what is read, never
+/// what the CLIs are signed in as.
+public struct AccountProfile: Codable, Equatable, Sendable, Identifiable, Hashable {
+    public var id: String
+    public var name: String
+    /// A Claude Code keychain item: the default one, or a config dir's
+    /// (`Claude Code-credentials-<hash>`). nil is the default.
+    public var claudeService: String?
+    /// A Codex account QuotaBar keeps (`CodexAccount.id`). nil is whichever
+    /// the CLI is signed in as.
+    public var codexAccountID: String?
+
+    public init(id: String = UUID().uuidString, name: String, claudeService: String? = nil, codexAccountID: String? = nil) {
+        self.id = id
+        self.name = name
+        self.claudeService = claudeService
+        self.codexAccountID = codexAccountID
+    }
+
+    /// The Claude item this profile reads, the default spelled out.
+    public var claudeItem: String { claudeService ?? LocalCredentials.claudeService }
+}
+
+extension ExperiencePrefs {
+    /// The profile the cards read, while there is more than one to choose
+    /// between; nil reads the CLIs' own sign-ins, as before profiles.
+    public var activeProfile: AccountProfile? {
+        guard accountProfiles.count > 1 else { return nil }
+        return accountProfiles.first { $0.id == activeProfileID } ?? accountProfiles.first
+    }
+}
+
+extension ExperiencePrefs {
+    /// The Claude Code item the card reads: the profile in use, else what the
+    /// arrow chose, else the default sign-in.
+    public var claudeItem: String {
+        let selected = activeProfile?.claudeItem ?? claudeSignInChoice ?? LocalCredentials.claudeService
+        return hiddenClaudeSignIns.contains(selected) ? LocalCredentials.claudeService : selected
+    }
+
+    /// The kept Codex account the card reads; nil follows the CLI.
+    public var codexAccountPin: String? {
+        activeProfile != nil ? activeProfile?.codexAccountID : codexAccountChoice
+    }
+}
+
+
+extension ExperiencePrefs {
+    /// Forget only QuotaBar's references, leaving Claude Code's login intact.
+    public mutating func forgetClaudeSignIn(_ service: String) {
+        guard service != LocalCredentials.claudeService else { return }
+        if !hiddenClaudeSignIns.contains(service) { hiddenClaudeSignIns.append(service) }
+        claudeAccountNames.removeValue(forKey: service)
+        if claudeSignInChoice == service { claudeSignInChoice = nil }
+        for index in accountProfiles.indices where accountProfiles[index].claudeService == service {
+            accountProfiles[index].claudeService = nil
+        }
+    }
+}

@@ -1,0 +1,532 @@
+import Foundation
+
+// MARK: - Display and behaviour preferences added in 0.5
+
+/// Reset labels as a countdown ("3 小时 25 分后重置") or a clock time
+/// ("今天 18:38 重置"). Clicking a reset label flips it everywhere.
+public enum ResetTimeFormat: String, Codable, CaseIterable, Identifiable, Sendable {
+    case countdown
+    case exact
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .countdown: L10n.t("Countdown", "倒计时")
+        case .exact: L10n.t("Exact time", "具体时间")
+        }
+    }
+}
+
+/// 12- or 24-hour clock for exact reset times; automatic follows the system.
+public enum ClockStyle: String, Codable, CaseIterable, Identifiable, Sendable {
+    case automatic
+    case twelveHour
+    case twentyFourHour
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .automatic: L10n.t("Automatic", "自动")
+        case .twelveHour: L10n.t("12-hour", "12 小时制")
+        case .twentyFourHour: L10n.t("24-hour", "24 小时制")
+        }
+    }
+}
+
+/// How a bar warns. The whole bar takes the usage colour, or — after
+/// codex-island — the bar keeps the brand colour and only the figure turns
+/// amber past 70% and red past 90%.
+public enum UrgencyStyle: String, Codable, CaseIterable, Identifiable, Sendable {
+    case bar
+    case figure
+    /// After openusage: the bar's colour is a verdict on the pace — green on
+    /// course, amber cutting it close, red running out before the reset.
+    case pace
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .bar: L10n.t("By usage", "按用量变色")
+        case .figure: L10n.t("Figure only", "只让数字变色")
+        case .pace: L10n.t("By pace", "按节奏变色")
+        }
+    }
+}
+
+/// Which tokens a token count counts. All includes cache reads and writes —
+/// what the CLIs report and what ccusage counts; billable is fresh input plus
+/// output, closer to what claude.ai's own usage page shows.
+public enum TokenCounting: String, Codable, CaseIterable, Identifiable, Sendable {
+    case all
+    case billable
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .all: L10n.t("All tokens", "全部 token")
+        case .billable: L10n.t("Input + output", "仅输入和输出")
+        }
+    }
+}
+
+/// Where the Claude card reads its figures from. Auto asks Claude Code's own
+/// sign-in first and falls back to a web sign-in — the Claude app's, then a
+/// browser's — when there is none; the others pin one way.
+public enum ClaudeSource: String, Codable, CaseIterable, Identifiable, Sendable {
+    case auto
+    case oauth
+    case web
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .auto: L10n.t("Automatic", "自动")
+        case .oauth: L10n.t("Claude Code only", "仅 Claude Code")
+        case .web: L10n.t("Web sign-in only", "仅网页登录")
+        }
+    }
+}
+
+/// Row spacing in the menu panel.
+public enum PanelDensity: String, Codable, CaseIterable, Identifiable, Sendable {
+    case regular
+    case compact
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .regular: L10n.t("Regular", "标准")
+        case .compact: L10n.t("Compact", "紧凑")
+        }
+    }
+}
+
+/// What the spend card's ring measures.
+public enum SpendMetric: String, Codable, CaseIterable, Identifiable, Sendable {
+    case cost
+    case tokens
+    case costPerMillion
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .cost: L10n.t("Cost", "花费")
+        case .tokens: L10n.t("Tokens", "Token")
+        case .costPerMillion: L10n.t("Cost / MTok", "每百万 token 花费")
+        }
+    }
+}
+
+/// How the island's panel draws a quota window, after codex-island's five —
+/// less its sparkline, which the owner dropped: a refresh-by-refresh line
+/// hardly moves inside a window and read as a flat bar. A saved "spark"
+/// decodes to the default.
+public enum IslandChartStyle: String, Codable, CaseIterable, Identifiable, Sendable {
+    case bar
+    case ring
+    case stepped
+    case numeric
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .bar: L10n.t("Bar", "条形")
+        case .ring: L10n.t("Ring", "圆环")
+        case .stepped: L10n.t("Stepped", "阶梯")
+        case .numeric: L10n.t("Numeric", "数字")
+        }
+    }
+
+    public var next: IslandChartStyle {
+        let all = Self.allCases
+        let index = all.firstIndex(of: self) ?? 0
+        return all[(index + 1) % all.count]
+    }
+}
+
+/// The three pace notifications, after openusage. All off by default.
+public struct PaceAlertPrefs: Codable, Equatable, Sendable {
+    /// Under 10% left, windows without a reset included.
+    public var almostOut: Bool
+    /// Projected to finish the window with less than 10% left.
+    public var cuttingClose: Bool
+    /// Projected to run out before the window resets.
+    public var willRunOut: Bool
+
+    public init(almostOut: Bool = false, cuttingClose: Bool = false, willRunOut: Bool = false) {
+        self.almostOut = almostOut
+        self.cuttingClose = cuttingClose
+        self.willRunOut = willRunOut
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        almostOut = (try? container.decodeIfPresent(Bool.self, forKey: .almostOut)) ?? false
+        cuttingClose = (try? container.decodeIfPresent(Bool.self, forKey: .cuttingClose)) ?? false
+        willRunOut = (try? container.decodeIfPresent(Bool.self, forKey: .willRunOut)) ?? false
+    }
+}
+
+/// The places a provider's figures are shown. Hiding a provider from one keeps
+/// it enabled — read, counted, and notified about — just not drawn there, and
+/// a surface's own light only speaks for what it draws.
+public enum DisplaySurface: String, Codable, CaseIterable, Sendable, Identifiable {
+    case panel
+    case dock
+    case island
+    case desktop
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .panel: L10n.t("Panel", "下拉面板")
+        case .dock: L10n.t("Dock", "停靠条")
+        case .island: L10n.t("Island", "刘海岛")
+        case .desktop: L10n.t("Desktop", "桌面卡片")
+        }
+    }
+}
+
+/// The places that stand one figure for a provider, each with its own say in
+/// which limit that figure is. They used to share one choice, the card's, so
+/// the island and the dock could only ever repeat the menu bar — and someone
+/// with a 5-hour and a weekly limit wants one here and the other there, or
+/// there is no point in having so many places.
+///
+/// The menu bar is not apart from the card. The panel hangs off its icon, so
+/// the card in it is the menu bar's own: which provider the icon shows is
+/// chosen from the icon's menu, and which of its limits by double-clicking
+/// that limit on the card. Given a choice of its own for a release, the menu
+/// bar stopped answering the double-click, and nobody could find the other.
+public enum FigurePlace: String, Codable, CaseIterable, Sendable, Identifiable {
+    /// The menu bar, the card's ring in the panel under it, and the desktop
+    /// cards drawn like it.
+    case card
+    case island
+    case dock
+
+    public var id: String { rawValue }
+
+    /// The places with a choice kept apart from the card's.
+    public static let apart: [FigurePlace] = [.island, .dock]
+
+    public var displayName: String {
+        switch self {
+        case .card: L10n.t("Menu bar and card", "菜单栏和卡片")
+        case .island: L10n.t("Notch island", "刘海岛")
+        case .dock: L10n.t("Dock", "停靠条")
+        }
+    }
+}
+
+/// A global shortcut: a Carbon virtual key code and Carbon modifier mask.
+public struct Hotkey: Codable, Equatable, Sendable {
+    public var keyCode: UInt32
+    public var modifiers: UInt32
+    /// What the recorder showed, e.g. "⌃⌥Q", so the field can say it back
+    /// without a keyboard-layout lookup.
+    public var display: String
+
+    public init(keyCode: UInt32, modifiers: UInt32, display: String) {
+        self.keyCode = keyCode
+        self.modifiers = modifiers
+        self.display = display
+    }
+}
+
+/// Everything 0.5 added to the preferences, kept in one object so the config
+/// file gains a single key and an older build ignores it wholesale. Every
+/// field decodes on its own, like the rest of the file: one value this build
+/// does not recognise must not reset the others.
+public struct ExperiencePrefs: Codable, Equatable, Sendable {
+    // Figures
+    public var resetTimeFormat: ResetTimeFormat = .countdown
+    public var clockStyle: ClockStyle = .automatic
+    /// Pace tick and "~35% left at reset" on every bar, not only the ones
+    /// that are close to or over their limit.
+    public var alwaysShowPace: Bool = false
+    public var urgencyStyle: UrgencyStyle = .bar
+    public var tokenCounting: TokenCounting = .all
+    /// ISO 4217 code costs are shown in. Prices stay in dollars underneath.
+    public var currency: String = "USD"
+
+    // Menu panel
+    public var panelDensity: PanelDensity = .regular
+    public var showSpendCard: Bool = true
+    /// openusage's Increase Transparency: the panel lets the desktop through.
+    public var panelTranslucent: Bool = false
+    public var spendMetric: SpendMetric = .cost
+    /// Provider cards whose "more" section is open, by provider id.
+    public var expandedCards: [String] = []
+    public var welcomeDismissed: Bool = false
+    /// Set once the first launch has matched providers to installed tools.
+    public var providersDetected: Bool = false
+
+    // Motion and glow
+    public var reduceMotion: Bool = false
+    public var islandGlow: Bool = true
+    /// The light keeps running round the island's outline even with nothing
+    /// happening. Off — the default — it runs while a read is in flight, on
+    /// hover, and near a limit. Continuous, it costs about 8% of a core for
+    /// as long as the island is on screen (issue #5).
+    public var islandSweepAlways: Bool = false
+    /// The island opens for a few seconds when a window crosses its warning.
+    public var islandAutoPeek: Bool = true
+    /// The island opens when the pointer rests on it; off, only a click does.
+    public var islandOpensOnHover: Bool = true
+    public var islandChart: IslandChartStyle = .stepped
+    /// The desktop card lists the provider closest to its limit first.
+    public var widgetSortsByUrgency: Bool = false
+    /// The cards on the desktop. Empty until the first 0.5 launch fills it.
+    public var deskCards: [DeskCard] = []
+    public var deskCardsMigrated: Bool = false
+
+    // Privacy and system
+    public var hideWhenSharing: Bool = false
+    public var hotkey: Hotkey?
+    public var paceAlerts: PaceAlertPrefs = PaceAlertPrefs()
+    /// The reset moment: the island's banner, the menu-bar glyph refilling,
+    /// "just reset" on the rows.
+    public var resetEffects: Bool = true
+    /// Whether a reset also raises a system notification.
+    public var resetNotify: ResetNotifyMode = .afterHeavyUse
+    /// A notification when a provider gives the account an early reset, and
+    /// a day before one runs out unspent.
+    public var resetCreditNotify: Bool = true
+    /// The run-out reminders already sent, by `ResetCreditNotice.key`.
+    public var resetCreditNotified: [String] = []
+    /// Providers hidden per surface, by raw value: still enabled, still read,
+    /// only not shown there.
+    public var hiddenProviders: [String: [String]] = [:]
+    /// Provider raw value → the ids of the windows its card shows before it
+    /// is expanded, where the owner chose them from the card's menu. Absent
+    /// means the card's own choice (`UsageSnapshot.upFrontWindows`).
+    public var cardWindows: [String: [String]] = [:]
+    /// Provider raw value → every window the provider reported when that
+    /// choice was made. A window not among them is one the choice never saw,
+    /// and is not folded by it.
+    public var cardWindowsKnown: [String: [String]] = [:]
+    /// Place raw value → provider raw value → the window that place's figure
+    /// follows, for the places in `FigurePlace.apart`. Absent means the
+    /// fullest window. The card's own choice stays in `headlineWindows`.
+    public var placeWindows: [String: [String: String]] = [:]
+    /// False only in a file written before the places had a say, where each
+    /// followed the card's choice: the config copies that choice to them
+    /// once, so nothing changes on the day of the update.
+    public var placeWindowsSeeded = true
+    /// Provider raw value → the ids of the windows the owner hid from the
+    /// card's menu: not on the card, not under its arrow, not followed by the
+    /// ring anywhere. Still read, cached and served by the local API.
+    public var hiddenWindows: [String: [String]] = [:]
+    /// Spend limits per day and per month, and the crossings already notified.
+    public var spendBudget: SpendBudget = SpendBudget()
+    public var budgetNotified: [String] = []
+    /// A prepaid balance below this notifies once per dip.
+    public var balanceFloor: BalanceFloor = BalanceFloor()
+    /// The providers already notified as low, until they are topped up.
+    public var balanceFloorNotified: [String] = []
+    /// Bars or a line for a prepaid card's usage.
+    public var balanceChart: BalanceChartStyle = .bars
+    /// A notification each Monday morning with last week's spend.
+    public var weeklyDigest: Bool = true
+    /// The week (`2026-W37`) whose digest was last sent.
+    public var weeklyDigestSent: String = ""
+    /// Serve 127.0.0.1:6736/v1/limits for other local tools.
+    public var localAPI: Bool = false
+    /// Write the readings to the owner's private iCloud for the iPhone app.
+    /// Off until the owner turns it on: it is the one thing that sends
+    /// readings off this Mac without a Quota Run account.
+    public var iCloudSync: Bool = false
+    /// "http://host:port" or "socks5://host:port"; empty = direct.
+    public var proxy: String = ""
+    public var betaUpdates: Bool = false
+    /// Work and personal (#8): which Claude sign-in and Codex account each
+    /// reads, and the one in use. Empty: the CLIs' own sign-ins.
+    public var accountProfiles: [AccountProfile] = []
+    public var activeProfileID: String?
+    public var claudeSource: ClaudeSource = .auto
+    /// What the arrow after each card's address chose, when no profile is in
+    /// use: a Claude Code keychain item (nil is the default sign-in), and a
+    /// kept Codex account (nil follows the CLI). One for each card, so
+    /// choosing a Claude account never touches Codex.
+    public var claudeSignInChoice: String?
+    public var hiddenClaudeSignIns: [String] = []
+    public var claudeAccountNames: [String: String] = [:]
+    public var codexAccountChoice: String?
+
+    // Sharing
+    public var shareSignature: String = ""
+    public var shareShowsSignature: Bool = false
+    /// A card copied as an image shows the signed-in account as a mosaic
+    /// rather than the address. On unless turned off: the image is made to
+    /// be posted, and the address is the one thing on it nobody meant to.
+    public var shareMasksAccount: Bool = true
+
+    public init() {}
+
+    private enum CodingKeys: String, CodingKey {
+        case resetTimeFormat, clockStyle, alwaysShowPace, urgencyStyle, tokenCounting, currency
+        case panelDensity, showSpendCard, panelTranslucent, spendMetric, expandedCards, welcomeDismissed, providersDetected
+        case reduceMotion, islandGlow, islandSweepAlways, islandAutoPeek, islandOpensOnHover, islandChart, widgetSortsByUrgency
+        case deskCards, deskCardsMigrated
+        case hideWhenSharing, hotkey, paceAlerts, localAPI, iCloudSync, proxy, betaUpdates
+        case resetEffects, resetNotify, resetCreditNotify, resetCreditNotified, hiddenProviders, cardWindows, cardWindowsKnown, hiddenWindows
+        case placeWindows, placeWindowsSeeded
+        case spendBudget, budgetNotified, balanceFloor, balanceFloorNotified, balanceChart, weeklyDigest, weeklyDigestSent
+        case shareSignature, shareShowsSignature, shareMasksAccount
+        case accountProfiles, activeProfileID, claudeSource, claudeSignInChoice, codexAccountChoice, hiddenClaudeSignIns, claudeAccountNames
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let d = ExperiencePrefs()
+        func value<T: Decodable>(_ key: CodingKeys, _ fallback: T) -> T {
+            (try? c.decodeIfPresent(T.self, forKey: key)) ?? fallback
+        }
+        func choice<T: RawRepresentable & Decodable>(_ key: CodingKeys, _ fallback: T) -> T where T.RawValue == String {
+            guard let raw = try? c.decodeIfPresent(String.self, forKey: key), let parsed = T(rawValue: raw)
+            else { return fallback }
+            return parsed
+        }
+        resetTimeFormat = choice(.resetTimeFormat, d.resetTimeFormat)
+        clockStyle = choice(.clockStyle, d.clockStyle)
+        alwaysShowPace = value(.alwaysShowPace, d.alwaysShowPace)
+        urgencyStyle = choice(.urgencyStyle, d.urgencyStyle)
+        tokenCounting = choice(.tokenCounting, d.tokenCounting)
+        let code = value(.currency, d.currency).uppercased()
+        currency = code.count == 3 && code.allSatisfy(\.isLetter) ? code : d.currency
+        panelDensity = choice(.panelDensity, d.panelDensity)
+        showSpendCard = value(.showSpendCard, d.showSpendCard)
+        panelTranslucent = value(.panelTranslucent, d.panelTranslucent)
+        spendMetric = choice(.spendMetric, d.spendMetric)
+        expandedCards = value(.expandedCards, d.expandedCards)
+        welcomeDismissed = value(.welcomeDismissed, d.welcomeDismissed)
+        providersDetected = value(.providersDetected, d.providersDetected)
+        reduceMotion = value(.reduceMotion, d.reduceMotion)
+        islandGlow = value(.islandGlow, d.islandGlow)
+        islandSweepAlways = value(.islandSweepAlways, d.islandSweepAlways)
+        islandAutoPeek = value(.islandAutoPeek, d.islandAutoPeek)
+        islandOpensOnHover = value(.islandOpensOnHover, d.islandOpensOnHover)
+        islandChart = choice(.islandChart, d.islandChart)
+        widgetSortsByUrgency = value(.widgetSortsByUrgency, d.widgetSortsByUrgency)
+        deskCards = value(.deskCards, d.deskCards)
+        deskCardsMigrated = value(.deskCardsMigrated, d.deskCardsMigrated)
+        hideWhenSharing = value(.hideWhenSharing, d.hideWhenSharing)
+        hotkey = try? c.decodeIfPresent(Hotkey.self, forKey: .hotkey)
+        paceAlerts = value(.paceAlerts, d.paceAlerts)
+        resetEffects = value(.resetEffects, d.resetEffects)
+        resetNotify = choice(.resetNotify, d.resetNotify)
+        resetCreditNotify = value(.resetCreditNotify, d.resetCreditNotify)
+        resetCreditNotified = value(.resetCreditNotified, d.resetCreditNotified)
+        hiddenProviders = value(.hiddenProviders, d.hiddenProviders)
+        cardWindows = value(.cardWindows, d.cardWindows)
+        cardWindowsKnown = value(.cardWindowsKnown, d.cardWindowsKnown)
+        placeWindows = value(.placeWindows, d.placeWindows)
+        placeWindowsSeeded = value(.placeWindowsSeeded, false)
+        hiddenWindows = value(.hiddenWindows, d.hiddenWindows)
+        spendBudget = value(.spendBudget, d.spendBudget)
+        budgetNotified = value(.budgetNotified, d.budgetNotified)
+        balanceFloor = value(.balanceFloor, d.balanceFloor)
+        balanceFloorNotified = value(.balanceFloorNotified, d.balanceFloorNotified)
+        balanceChart = choice(.balanceChart, d.balanceChart)
+        weeklyDigest = value(.weeklyDigest, d.weeklyDigest)
+        weeklyDigestSent = value(.weeklyDigestSent, d.weeklyDigestSent)
+        localAPI = value(.localAPI, d.localAPI)
+        iCloudSync = value(.iCloudSync, d.iCloudSync)
+        proxy = value(.proxy, d.proxy)
+        betaUpdates = value(.betaUpdates, d.betaUpdates)
+        shareSignature = value(.shareSignature, d.shareSignature)
+        shareShowsSignature = value(.shareShowsSignature, d.shareShowsSignature)
+        shareMasksAccount = value(.shareMasksAccount, d.shareMasksAccount)
+        accountProfiles = value(.accountProfiles, d.accountProfiles)
+        activeProfileID = try? c.decodeIfPresent(String.self, forKey: .activeProfileID)
+        claudeSource = choice(.claudeSource, d.claudeSource)
+        claudeSignInChoice = try? c.decodeIfPresent(String.self, forKey: .claudeSignInChoice)
+        codexAccountChoice = try? c.decodeIfPresent(String.self, forKey: .codexAccountChoice)
+        hiddenClaudeSignIns = value(.hiddenClaudeSignIns, d.hiddenClaudeSignIns)
+        claudeAccountNames = value(.claudeAccountNames, d.claudeAccountNames)
+        migrateArrowProfiles()
+    }
+}
+
+extension ExperiencePrefs {
+    /// 0.5.30-beta.1 made a profile named after the address of each Claude
+    /// sign-in picked on the card's arrow, which put Claude's addresses on the
+    /// Codex card too. Those are dropped — only ones named by an address and
+    /// pinning no Codex account, which no one types by hand — and the sign-in
+    /// in use stays as the arrow's own choice.
+    mutating func migrateArrowProfiles() {
+        guard !accountProfiles.isEmpty, accountProfiles.allSatisfy({ $0.name.contains("@") && $0.codexAccountID == nil })
+        else { return }
+        claudeSignInChoice = activeProfile?.claudeService
+        accountProfiles = []
+        activeProfileID = nil
+    }
+
+    public func isHidden(_ id: ProviderID, on surface: DisplaySurface) -> Bool {
+        hiddenProviders[surface.rawValue]?.contains(id.rawValue) ?? false
+    }
+
+    public mutating func setHidden(_ hidden: Bool, _ id: ProviderID, on surface: DisplaySurface) {
+        var list = hiddenProviders[surface.rawValue] ?? []
+        list.removeAll { $0 == id.rawValue }
+        if hidden { list.append(id.rawValue) }
+        hiddenProviders[surface.rawValue] = list.isEmpty ? nil : list
+    }
+
+    public func placeWindow(for id: ProviderID, on place: FigurePlace) -> String? {
+        placeWindows[place.rawValue]?[id.rawValue]
+    }
+
+    public mutating func setPlaceWindow(_ windowID: String?, for id: ProviderID, on place: FigurePlace) {
+        var picks = placeWindows[place.rawValue] ?? [:]
+        picks[id.rawValue] = windowID
+        placeWindows[place.rawValue] = picks.isEmpty ? nil : picks
+    }
+
+    /// `ids` in order, without the ones hidden from `surface`.
+    public func visible(_ ids: [ProviderID], on surface: DisplaySurface) -> [ProviderID] {
+        let hidden = Set(hiddenProviders[surface.rawValue] ?? [])
+        return ids.filter { !hidden.contains($0.rawValue) }
+    }
+}
+
+// MARK: - Room on the island
+
+/// What the island has room to draw. The notch has a side each, so the strip
+/// and the open panel show two columns of `slots`; the pill on a screen with
+/// no notch is one strip of fixed width, and three figures fit in it. The
+/// providers past that stay enabled and read, and the island never mentions
+/// them: its glow, its flash and its peek speak for what it shows, or a quota
+/// running out behind it turns the island red with nothing on it to say why.
+///
+/// "Shows" is the closed island: the glow, the flash and the peek all happen
+/// while it is closed, so that is where the reason has to be in sight. With
+/// no notch and two or three slots the open panel has room for more than the
+/// pill's three, and draws them; a fourth running out colours its own figure
+/// there and leaves the pill alone.
+public enum IslandRoom {
+    public static let pillCount = 3
+
+    /// Left takes the first `slots` providers, right the next.
+    public static func columns(_ ids: [ProviderID], slots: Int) -> (left: [ProviderID], right: [ProviderID]) {
+        let slots = max(slots, 1)
+        return (Array(ids.prefix(slots)), Array(ids.dropFirst(slots).prefix(slots)))
+    }
+
+    /// The providers on the closed island, in the order it draws them.
+    public static func shown(_ ids: [ProviderID], slots: Int, pill: Bool) -> [ProviderID] {
+        let both = columns(ids, slots: slots)
+        let all = both.left + both.right
+        return pill ? Array(all.prefix(pillCount)) : all
+    }
+}

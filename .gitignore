@@ -1,0 +1,10 @@
+.build*/
+build/
+dist/
+research/
+.DS_Store
+__pycache__/
+*.pyc
+.env*
+*.pem
+*.p12

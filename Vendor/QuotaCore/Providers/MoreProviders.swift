@@ -1,0 +1,806 @@
+import Foundation
+
+// MARK: - Providers added in 0.5
+//
+// Endpoints and fields follow CodexBar's (MIT) working implementations of the
+// same services. Only Copilot could be exercised against a live account while
+// these were written; the rest are marked experimental in Settings until an
+// owner's account confirms them.
+
+// MARK: - Shared helpers
+
+enum ProviderJSON {
+    static func object(_ data: Data) -> Any? {
+        try? JSONSerialization.jsonObject(with: data)
+    }
+
+    static func dictionary(_ value: Any?) -> [String: Any]? { value as? [String: Any] }
+
+    static func string(_ value: Any?) -> String? {
+        switch value {
+        case let string as String:
+            let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        case let number as NSNumber: return number.stringValue
+        default: return nil
+        }
+    }
+
+    /// The first value under any of `keys`, searched depth-first.
+    static func first(_ keys: [String], in value: Any) -> Any? {
+        if let dictionary = value as? [String: Any] {
+            for key in keys { if let hit = dictionary[key], !(hit is NSNull) { return hit } }
+            for child in dictionary.values { if let hit = first(keys, in: child) { return hit } }
+        } else if let array = value as? [Any] {
+            for child in array { if let hit = first(keys, in: child) { return hit } }
+        }
+        return nil
+    }
+
+    static func percent(used: Double, total: Double) -> Double? {
+        guard total > 0 else { return nil }
+        return min(max(used / total * 100, 0), 100)
+    }
+}
+
+/// Runs a command-line tool the owner already has signed in, and returns its
+/// standard output. Looks where Homebrew, npm, cargo and the tools' own
+/// installers put binaries; a GUI app does not inherit the shell's PATH.
+enum ToolRunner {
+    static let searchPaths: [String] = {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        return ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "\(home)/.local/bin", "\(home)/bin",
+                "\(home)/.cargo/bin", "\(home)/go/bin", "\(home)/.npm-global/bin", "\(home)/.volta/bin",
+                "\(home)/.arkcli/bin", "\(home)/.bun/bin"]
+    }()
+
+    static func locate(_ name: String) -> String? {
+        let fm = FileManager.default
+        return searchPaths.map { "\($0)/\(name)" }.first { fm.isExecutableFile(atPath: $0) }
+    }
+
+    static func run(
+        _ path: String, _ arguments: [String], timeout: TimeInterval = 20, in directory: URL? = nil) -> (status: Int32, output: Data)?
+    {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = arguments
+        process.currentDirectoryURL = directory
+        var environment = ProcessInfo.processInfo.environment
+        environment["PATH"] = (searchPaths + [environment["PATH"] ?? ""]).joined(separator: ":")
+        environment["NO_COLOR"] = "1"
+        process.environment = environment
+        let stdout = Pipe()
+        process.standardOutput = stdout
+        process.standardError = FileHandle.nullDevice
+        process.standardInput = FileHandle.nullDevice
+        do { try process.run() } catch { return nil }
+        let deadline = DispatchTime.now() + timeout
+        let done = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in done.signal() }
+        let reader = DispatchQueue(label: "bar.quota.tool")
+        var output = Data()
+        let readDone = DispatchSemaphore(value: 0)
+        reader.async {
+            output = stdout.fileHandleForReading.readDataToEndOfFile()
+            readDone.signal()
+        }
+        if done.wait(timeout: deadline) == .timedOut {
+            process.terminate()
+            return nil
+        }
+        _ = readDone.wait(timeout: .now() + 2)
+        return (process.terminationStatus, output)
+    }
+}
+
+// MARK: - 阿里云百炼 Coding Plan
+
+/// Alibaba Cloud Model Studio (百炼) Coding Plan: 5-hour, weekly and monthly
+/// request quotas from the console's own gateway, signed in by cookie. China
+/// mainland first, then the international console.
+public struct AlibabaCodingPlanProvider: QuotaProvider {
+    public let id = ProviderID.alibaba
+
+    struct Region {
+        let console: String
+        let referer: String
+        let gateway: String
+        let action: String
+        let commodity: String
+        let regionID: String
+        let site: String
+
+        static let china = Region(
+            console: "https://bailian.console.aliyun.com",
+            referer: "https://bailian.console.aliyun.com/cn-beijing/?tab=model",
+            gateway: "https://bailian-cs.console.aliyun.com",
+            action: "BroadScopeAspnGateway",
+            commodity: "sfm_codingplan_public_cn",
+            regionID: "cn-beijing",
+            site: "BAILIAN_ALIYUN")
+        static let international = Region(
+            console: "https://modelstudio.console.alibabacloud.com",
+            referer: "https://modelstudio.console.alibabacloud.com/ap-southeast-1/?tab=coding-plan",
+            gateway: "https://bailian-singapore-cs.alibabacloud.com",
+            action: "IntlBroadScopeAspnGateway",
+            commodity: "sfm_codingplan_public_intl",
+            regionID: "ap-southeast-1",
+            site: "MODELSTUDIO_ALIBABACLOUD")
+    }
+
+    /// The name the console's own subscription page calls it by; the older
+    /// `broadscope-bailian` spelling still answered in September 2026.
+    static let api = "zeldaEasy.bailian-commerce.codingPlan.queryCodingPlanInstanceInfoV2"
+
+    public func isConfigured(config: ConfigStore) -> Bool { config.credential(for: id) != nil }
+
+    public func fetch(config: ConfigStore) async throws -> UsageSnapshot {
+        let cookie = try QwenProvider.cookieHeader(config.credential(for: id), for: id)
+        // The cookie belongs to one site; the other one's failure says
+        // nothing about it. The error kept is the one that says most: no
+        // plan, then anything but a refusal, then the refusal.
+        var kept: Error = ProviderError.unauthorized
+        func rank(_ error: Error) -> Int {
+            switch error as? ProviderError {
+            case .noPlan: 3
+            case .unauthorized: 1
+            default: 2
+            }
+        }
+        for region in [Region.china, .international] {
+            do {
+                return try await fetch(region: region, cookie: cookie)
+            } catch {
+                if rank(error) > rank(kept) { kept = error }
+            }
+        }
+        throw kept
+    }
+
+    private func fetch(region: Region, cookie: String) async throws -> UsageSnapshot {
+        let page = try? await HTTP.get(URL(string: region.referer)!, headers: [
+            "Cookie": cookie, "Accept": "text/html,application/xhtml+xml", "User-Agent": QwenProvider.browserAgent,
+        ])
+        guard let secToken = page.flatMap({ QwenProvider.secToken(inHTML: String(decoding: $0.data, as: UTF8.self)) })
+            ?? QwenProvider.cookieValue("sec_token", in: cookie)
+        else {
+            // Sent to the sign-in host: the session is over. Still on the
+            // console with no token in the page: the page changed, which is
+            // not the owner's to fix by signing in again.
+            let host = page?.url?.host ?? ""
+            if page == nil || ["signin", "login", "passport"].contains(where: host.contains) { throw ProviderError.unauthorized }
+            throw ProviderError.badResponse
+        }
+
+        var components = URLComponents(string: region.gateway + "/data/api.json")!
+        components.queryItems = [
+            URLQueryItem(name: "action", value: region.action),
+            URLQueryItem(name: "product", value: "sfm_bailian"),
+            URLQueryItem(name: "api", value: Self.api),
+            URLQueryItem(name: "_v", value: "undefined"),
+        ]
+        var cornerstone: [String: Any] = [
+            "feTraceId": UUID().uuidString.lowercased(), "feURL": region.referer, "protocol": "V2",
+            "console": "ONE_CONSOLE", "productCode": "p_efm", "domain": URL(string: region.console)?.host ?? "",
+            "consoleSite": region.site, "userNickName": "", "userPrincipalName": "", "xsp_lang": "zh-CN",
+        ]
+        if let anonymous = QwenProvider.cookieValue("cna", in: cookie) { cornerstone["X-Anonymous-Id"] = anonymous }
+        let params: [String: Any] = [
+            "Api": Self.api, "V": "1.0",
+            "Data": [
+                "queryCodingPlanInstanceInfoRequest": ["commodityCode": region.commodity, "onlyLatestOne": true],
+                "cornerstoneParam": cornerstone,
+            ],
+        ]
+        var form = URLComponents()
+        form.queryItems = [
+            URLQueryItem(name: "params", value: String(decoding: try JSONSerialization.data(withJSONObject: params), as: UTF8.self)),
+            URLQueryItem(name: "region", value: region.regionID),
+            URLQueryItem(name: "sec_token", value: secToken),
+        ]
+        var headers = [
+            "Content-Type": "application/x-www-form-urlencoded", "Accept": "*/*", "Cookie": cookie,
+            "X-Requested-With": "XMLHttpRequest", "User-Agent": QwenProvider.browserAgent,
+            "Origin": region.console, "Referer": region.referer,
+        ]
+        if let csrf = QwenProvider.cookieValue("login_aliyunid_csrf", in: cookie) ?? QwenProvider.cookieValue("csrf", in: cookie) {
+            headers["x-xsrf-token"] = csrf
+            headers["x-csrf-token"] = csrf
+        }
+        let response = try await HTTP.post(components.url!, headers: headers, jsonBody: form.percentEncodedQuery ?? "").requireOK()
+        return try Self.parse(response.data)
+    }
+
+    /// The gateway nests the plan's JSON, sometimes as a string; the quota
+    /// object is wherever its counters are.
+    public static func parse(_ data: Data) throws -> UsageSnapshot {
+        guard let raw = ProviderJSON.object(data) else { throw ProviderError.badResponse }
+        let root = QwenProvider.expandEmbeddedJSON(raw)
+        let text = String(decoding: data, as: UTF8.self)
+        let counters: Set<String> = ["per5HourTotalQuota", "perWeekTotalQuota", "perBillMonthTotalQuota", "perFiveHourTotalQuota", "perMonthTotalQuota"]
+        guard let quota = QwenProvider.findObject(containingAnyOf: counters, in: root) else {
+            // Only the gateway's own sign-in codes. Any reply with "login"
+            // anywhere in it used to count, and read as an expired session.
+            if ["ConsoleNeedLogin", "NeedLogin", "NotLogin"].contains(where: text.contains) { throw ProviderError.unauthorized }
+            // Signed in, no plan: `"codingPlanInstanceInfos": []`.
+            if let instances = QwenProvider.findObject(containingAnyOf: ["codingPlanInstanceInfos"], in: root)?["codingPlanInstanceInfos"] as? [Any],
+               instances.isEmpty
+            {
+                throw ProviderError.noPlan(L10n.t(
+                    "This Alibaba Cloud account has no Coding Plan. Alibaba Cloud now sells it as Token Plan, which QuotaBar can't read yet.",
+                    "这个阿里云账号没有订阅百炼 Coding Plan。阿里云现在改为售卖 Token Plan，QuotaBar 暂时还读不了 Token Plan 的额度。"))
+            }
+            throw ProviderError.badResponse
+        }
+        func window(_ title: String, _ used: [String], _ total: [String], _ reset: [String], seconds: Int) -> UsageWindow? {
+            guard let totalValue = total.lazy.compactMap({ QwenProvider.number(quota[$0]) }).first, totalValue > 0 else { return nil }
+            let usedValue = used.lazy.compactMap { QwenProvider.number(quota[$0]) }.first
+            return UsageWindow(
+                title: title,
+                usedPercent: usedValue.flatMap { ProviderJSON.percent(used: $0, total: totalValue) },
+                detail: usedValue.map { L10n.t("\(Int($0)) / \(Int(totalValue)) requests", "\(Int($0)) / \(Int(totalValue)) 次请求") },
+                resetsAt: reset.lazy.compactMap { QwenProvider.date(quota[$0]) }.first,
+                windowSeconds: seconds)
+        }
+        let windows = [
+            window(L10n.t("5-hour window", "5 小时窗口"), ["per5HourUsedQuota", "perFiveHourUsedQuota"], ["per5HourTotalQuota", "perFiveHourTotalQuota"], ["per5HourQuotaNextRefreshTime", "perFiveHourQuotaNextRefreshTime"], seconds: 18_000),
+            window(L10n.t("Weekly window", "周窗口"), ["perWeekUsedQuota"], ["perWeekTotalQuota"], ["perWeekQuotaNextRefreshTime"], seconds: 604_800),
+            window(L10n.t("Monthly window", "月窗口"), ["perBillMonthUsedQuota", "perMonthUsedQuota"], ["perBillMonthTotalQuota", "perMonthTotalQuota"], ["perBillMonthQuotaNextRefreshTime", "perMonthQuotaNextRefreshTime"], seconds: 2_592_000),
+        ].compactMap { $0 }
+        guard !windows.isEmpty else { throw ProviderError.badResponse }
+        let plan = ProviderJSON.first(["planName", "instanceName", "packageName"], in: root).flatMap(ProviderJSON.string)
+        return UsageSnapshot(planName: plan, windows: windows)
+    }
+}
+
+// MARK: - 火山方舟 Coding Plan
+
+/// Volcengine Ark (火山方舟, Doubao) Coding and Agent Plans, read through the
+/// official `arkcli` the owner has signed in with (`arkcli auth login`).
+public struct VolcengineArkProvider: QuotaProvider {
+    public let id = ProviderID.volcengine
+
+    public func isConfigured(config: ConfigStore) -> Bool { ToolRunner.locate("arkcli") != nil }
+
+    public func fetch(config: ConfigStore) async throws -> UsageSnapshot {
+        guard let path = ToolRunner.locate("arkcli") else { throw ProviderError.notConfigured(hint: id.setupHint) }
+        let result = await Task.detached { ToolRunner.run(path, ["usage", "plan", "--format", "json"]) }.value
+        guard let result else { throw ProviderError.network(L10n.t("arkcli timed out", "arkcli 超时")) }
+        return try Self.parse(result.output)
+    }
+
+    public static func parse(_ data: Data) throws -> UsageSnapshot {
+        guard let root = ProviderJSON.object(data) as? [String: Any] else { throw ProviderError.badResponse }
+        if let method = (root["viewer"] as? [String: Any])?["auth_method"] as? String, method.lowercased() == "none" {
+            throw ProviderError.unauthorized
+        }
+        let products: [String: String] = [
+            "coding-plan": "Coding Plan", "agent-plan": "Agent Plan",
+            "coding-plan-team": L10n.t("Coding Plan · team", "Coding Plan · 团队"),
+            "agent-plan-team": L10n.t("Agent Plan · team", "Agent Plan · 团队"),
+        ]
+        var windows: [UsageWindow] = []
+        var plans: [String] = []
+        for item in root["items"] as? [[String: Any]] ?? [] {
+            guard let product = (item["product"] as? String)?.lowercased(), let name = products[product],
+                  (item["subscribed"] as? Bool) != false
+            else { continue }
+            let periods = item["periods"] as? [[String: Any]] ?? []
+            if !periods.isEmpty { plans.append(name) }
+            for period in periods {
+                let label = (period["label"] as? String ?? "").lowercased()
+                let seconds = label.contains("week") ? 604_800 : label.contains("month") ? 2_592_000 : 18_000
+                let title = WindowTitle.forSeconds(seconds)
+                windows.append(UsageWindow(
+                    title: product == "coding-plan" ? title : "\(name) · \(title)",
+                    usedPercent: QwenProvider.number(period["percent"]).map { min(max($0 <= 1 && $0 > 0 ? $0 * 100 : $0, 0), 100) },
+                    resetsAt: QwenProvider.date(period["reset_at"]),
+                    windowSeconds: seconds,
+                    scope: product == "coding-plan" ? nil : name))
+            }
+        }
+        guard !windows.isEmpty else { throw ProviderError.badResponse }
+        return UsageSnapshot(planName: plans.first, windows: windows)
+    }
+}
+
+// MARK: - 智谱 GLM Coding Plan（国内站）
+
+/// Zhipu's GLM Coding Plan on bigmodel.cn: the same quota endpoint as z.ai,
+/// on the China host.
+public struct ZhipuProvider: QuotaProvider {
+    public let id = ProviderID.zhipu
+
+    public func isConfigured(config: ConfigStore) -> Bool { config.credential(for: id) != nil }
+
+    public func fetch(config: ConfigStore) async throws -> UsageSnapshot {
+        guard let key = config.credential(for: id) else { throw ProviderError.notConfigured(hint: id.setupHint) }
+        return try await ZaiProvider.fetchQuota(host: "https://open.bigmodel.cn", key: key)
+    }
+}
+
+// MARK: - GitHub Copilot
+
+/// Copilot's monthly premium requests, chat and completions, from the
+/// endpoint the editors read. Signed in through the GitHub CLI the owner
+/// already uses (`gh auth token`), or a pasted token.
+public struct CopilotProvider: QuotaProvider {
+    public let id = ProviderID.copilot
+
+    public func isConfigured(config: ConfigStore) -> Bool {
+        config.credential(for: id) != nil || ToolRunner.locate("gh") != nil
+    }
+
+    static func token(config: ConfigStore) async -> String? {
+        if let manual = config.credential(for: .copilot) { return manual.trimmingCharacters(in: .whitespacesAndNewlines) }
+        guard let gh = ToolRunner.locate("gh") else { return nil }
+        let result = await Task.detached { ToolRunner.run(gh, ["auth", "token"], timeout: 10) }.value
+        guard let result, result.status == 0 else { return nil }
+        let token = String(decoding: result.output, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        return token.isEmpty ? nil : token
+    }
+
+    public func fetch(config: ConfigStore) async throws -> UsageSnapshot {
+        guard let token = await Self.token(config: config) else { throw ProviderError.notConfigured(hint: id.setupHint) }
+        let response = try await HTTP.get(URL(string: "https://api.github.com/copilot_internal/user")!, headers: [
+            "Authorization": "token \(token)",
+            "Accept": "application/json",
+            "Editor-Version": "vscode/1.96.2",
+            "Editor-Plugin-Version": "copilot-chat/0.26.7",
+            "User-Agent": "GitHubCopilotChat/0.26.7",
+            "X-Github-Api-Version": "2025-04-01",
+        ])
+        if response.status == 404 {
+            throw ProviderError.noPlan(L10n.t("This GitHub account has no Copilot.", "这个 GitHub 账号没有 Copilot。"))
+        }
+        return try Self.parse(try response.requireOK().data)
+    }
+
+    public static func parse(_ data: Data) throws -> UsageSnapshot {
+        guard let root = ProviderJSON.object(data) as? [String: Any] else { throw ProviderError.badResponse }
+        let reset = (root["quota_reset_date_utc"] as? String).flatMap(Dates.parseISO)
+            ?? (root["quota_reset_date"] as? String).flatMap(day)
+            ?? (root["limited_user_reset_date"] as? String).flatMap(day)
+        let titles: [String: String] = [
+            "premium_interactions": L10n.t("Premium requests", "高级请求"),
+            "chat": L10n.t("Chat", "聊天"),
+            "completions": L10n.t("Completions", "代码补全"),
+        ]
+        var windows: [UsageWindow] = []
+        let snapshots = root["quota_snapshots"] as? [String: Any] ?? [:]
+        for key in ["premium_interactions", "chat", "completions"] {
+            guard let snapshot = snapshots[key] as? [String: Any], (snapshot["unlimited"] as? Bool) != true else { continue }
+            let entitlement = QwenProvider.number(snapshot["entitlement"]) ?? 0
+            let remaining = QwenProvider.number(snapshot["remaining"])
+            let percentRemaining = QwenProvider.number(snapshot["percent_remaining"])
+                ?? remaining.flatMap { entitlement > 0 ? $0 / entitlement * 100 : nil }
+            guard let percentRemaining, entitlement > 0 || snapshot["percent_remaining"] != nil else { continue }
+            windows.append(UsageWindow(
+                title: titles[key] ?? key,
+                usedPercent: min(max(100 - percentRemaining, 0), 100),
+                detail: remaining.map { L10n.t("\(Int($0)) of \(Int(entitlement)) left", "剩余 \(Int($0)) / \(Int(entitlement))") },
+                resetsAt: reset))
+        }
+        // The free plan reports what is left and what the month allows separately.
+        if windows.isEmpty, let left = root["limited_user_quotas"] as? [String: Any], let monthly = root["monthly_quotas"] as? [String: Any] {
+            for key in ["chat", "completions"] {
+                guard let total = QwenProvider.number(monthly[key]), total > 0, let remaining = QwenProvider.number(left[key]) else { continue }
+                windows.append(UsageWindow(
+                    title: titles[key] ?? key,
+                    usedPercent: ProviderJSON.percent(used: total - remaining, total: total),
+                    detail: L10n.t("\(Int(remaining)) of \(Int(total)) left", "剩余 \(Int(remaining)) / \(Int(total))"),
+                    resetsAt: reset))
+            }
+        }
+        let sku = (root["access_type_sku"] as? String)?.lowercased() ?? ""
+        if windows.isEmpty {
+            windows.append(UsageWindow(
+                title: L10n.t("Subscription", "订阅"),
+                detail: sku.contains("ended")
+                    ? L10n.t("Subscription ended", "订阅已结束")
+                    : L10n.t("Unlimited on this plan", "此套餐不限量")))
+        }
+        let plan = (root["copilot_plan"] as? String).map { $0.prefix(1).uppercased() + $0.dropFirst() }
+        return UsageSnapshot(planName: plan, account: root["login"] as? String, windows: windows)
+    }
+
+    private static func day(_ string: String) -> Date? {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "UTC")
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.date(from: String(string.prefix(10)))
+    }
+}
+
+// MARK: - OpenRouter
+
+/// OpenRouter credits and, when the key has one, its spending limit.
+public struct OpenRouterProvider: QuotaProvider {
+    public let id = ProviderID.openrouter
+
+    public func isConfigured(config: ConfigStore) -> Bool { config.credential(for: id) != nil }
+
+    public func fetch(config: ConfigStore) async throws -> UsageSnapshot {
+        guard let key = config.credential(for: id)?.trimmingCharacters(in: .whitespacesAndNewlines) else {
+            throw ProviderError.notConfigured(hint: id.setupHint)
+        }
+        let headers = ["Authorization": "Bearer \(key)", "Accept": "application/json", "X-Title": "QuotaBar", "HTTP-Referer": "https://quota.bar"]
+        // A provisioning key lists every key with its spend but may not be
+        // let read the credits, and an ordinary key reads the credits but not
+        // the list: ask for all three and keep what answers.
+        var failure: Error = ProviderError.badResponse
+        func read(_ path: String) async -> Data? {
+            do {
+                return try await HTTP.get(URL(string: "https://openrouter.ai/api/v1/\(path)")!, headers: headers).requireOK().data
+            } catch {
+                failure = error
+                return nil
+            }
+        }
+        let credits = await read("credits")
+        let creditsFailure = failure
+        let keyInfo = await read("key")
+        let keyList = await read("keys")
+        guard credits != nil || keyList != nil else { throw credits == nil ? creditsFailure : failure }
+        return try Self.parse(credits: credits, key: keyInfo, keys: keyList)
+    }
+
+    public static func parse(credits: Data?, key: Data?, keys: Data? = nil) throws -> UsageSnapshot {
+        var windows: [UsageWindow] = []
+        var balances: [AccountBalance] = []
+        var represented: [String] = []
+        var creditsUsed: Double?
+        if let credits {
+            guard let body = ProviderJSON.object(credits) as? [String: Any], let data = body["data"] as? [String: Any],
+                  let total = QwenProvider.number(data["total_credits"]), let used = QwenProvider.number(data["total_usage"])
+            else { throw ProviderError.badResponse }
+            let credit = UsageWindow(
+                title: L10n.t("Credits", "额度"),
+                usedPercent: ProviderJSON.percent(used: used, total: total),
+                detail: L10n.t("$\(String(format: "%.2f", max(0, total - used))) left of $\(String(format: "%.2f", total))",
+                               "剩余 $\(String(format: "%.2f", max(0, total - used))) / 共 $\(String(format: "%.2f", total))"))
+            windows.append(credit)
+            represented.append(credit.id)
+            balances.append(AccountBalance(currency: "USD", total: max(0, total - used), paid: total))
+            creditsUsed = used
+        }
+        var current: APIKeyUsage?
+        if let keyBody = key.flatMap(ProviderJSON.object) as? [String: Any], let info = keyBody["data"] as? [String: Any] {
+            current = keyUsage(info, id: "current")
+            if let limit = QwenProvider.number(info["limit"]), limit > 0 {
+                let remaining = QwenProvider.number(info["limit_remaining"]) ?? limit
+                windows.append(UsageWindow(
+                    title: L10n.t("Key limit", "密钥额度"),
+                    usedPercent: ProviderJSON.percent(used: limit - remaining, total: limit),
+                    detail: L10n.t("$\(String(format: "%.2f", remaining)) left of $\(String(format: "%.2f", limit))",
+                                   "剩余 $\(String(format: "%.2f", remaining)) / 共 $\(String(format: "%.2f", limit))"),
+                    resetsAt: QwenProvider.date(info["limit_reset"])))
+            }
+            let daily = QwenProvider.number(info["usage_daily"]), weekly = QwenProvider.number(info["usage_weekly"]), monthly = QwenProvider.number(info["usage_monthly"])
+            if daily != nil || weekly != nil || monthly != nil {
+                func money(_ value: Double?) -> String { value.map { "$" + String(format: "%.2f", $0) } ?? "—" }
+                let spent = UsageWindow(
+                    title: L10n.t("Spend", "花费"),
+                    detail: L10n.t("Today \(money(daily)) · week \(money(weekly)) · month \(money(monthly))",
+                                   "今日 \(money(daily)) · 本周 \(money(weekly)) · 本月 \(money(monthly))"))
+                windows.append(spent)
+                represented.append(spent.id)
+            }
+        }
+
+        // `GET /keys` answers a provisioning key only: every key the account
+        // has, with its spend today, this week and this month (UTC).
+        var listed: [APIKeyUsage]?
+        if let body = keys.flatMap(ProviderJSON.object) as? [String: Any], let entries = body["data"] as? [[String: Any]] {
+            listed = entries.enumerated().map { index, entry in
+                keyUsage(entry, id: ProviderJSON.string(entry["hash"]) ?? "key-\(index)")
+            }
+        }
+        guard !windows.isEmpty || listed != nil else { throw ProviderError.badResponse }
+
+        let shown = listed ?? current.map { [$0] }
+        var usage: [KeyUsagePeriod: KeyUsageFigures] = [:]
+        for period in KeyUsagePeriod.allCases {
+            let total = (shown ?? []).compactMap { $0.usage[period]?.costs.first?.amount }.reduce(0, +)
+            usage[period] = KeyUsageFigures(costs: total > 0 ? [Money(currency: "USD", amount: total)] : [])
+        }
+        // Everything the account ever spent, when the credits could be read.
+        if let spentEver = creditsUsed { usage[.all] = KeyUsageFigures(costs: [Money(currency: "USD", amount: spentEver)]) }
+        return UsageSnapshot(
+            windows: windows,
+            balance: BalanceSheet(
+                balances: balances,
+                usage: usage,
+                keys: shown,
+                keysNote: listed == nil
+                    ? L10n.t(
+                        "This is the key in Settings. Paste a provisioning key (openrouter.ai → Settings → Provisioning Keys) to see every key.",
+                        "这里只有设置里填的这个 Key。改填管理密钥（openrouter.ai → Settings → Provisioning Keys）可以看到所有 Key。")
+                    : nil,
+                representedWindowIDs: represented))
+    }
+
+    /// One key from `/key` or `/keys`: name or label, and dollars spent per
+    /// period. OpenRouter counts dollars, not requests, and counts them by
+    /// its own UTC day, week and month — so its seven and thirty days are
+    /// this week and this month.
+    static func keyUsage(_ info: [String: Any], id: String) -> APIKeyUsage {
+        var usage: [KeyUsagePeriod: KeyUsageFigures] = [:]
+        for (period, field) in [(KeyUsagePeriod.today, "usage_daily"), (.last7, "usage_weekly"), (.last30, "usage_monthly"), (.all, "usage")] {
+            if let value = QwenProvider.number(info[field]), value > 0 {
+                usage[period] = KeyUsageFigures(costs: [Money(currency: "USD", amount: value)])
+            }
+        }
+        return APIKeyUsage(
+            id: id,
+            name: ProviderJSON.string(info["name"]) ?? ProviderJSON.string(info["label"]) ?? L10n.t("This key", "当前 Key"),
+            maskedKey: ProviderJSON.string(info["name"]) != nil ? ProviderJSON.string(info["label"]) : nil,
+            isDisabled: (info["disabled"] as? Bool) == true,
+            usage: usage)
+    }
+}
+
+// MARK: - 小米 MiMo
+
+/// Xiaomi MiMo: the Token Plan's monthly usage and the account balance, by
+/// the platform console's cookie.
+public struct MiMoProvider: QuotaProvider {
+    public let id = ProviderID.mimo
+    static let base = "https://platform.xiaomimimo.com/api/v1"
+
+    public func isConfigured(config: ConfigStore) -> Bool { config.credential(for: id) != nil }
+
+    public func fetch(config: ConfigStore) async throws -> UsageSnapshot {
+        let cookie = try QwenProvider.cookieHeader(config.credential(for: id), for: id)
+        let headers = [
+            "Cookie": cookie, "Accept": "application/json, text/plain, */*", "Accept-Language": "zh-CN,zh;q=0.9",
+            "x-timeZone": "UTC+08:00", "Origin": "https://platform.xiaomimimo.com",
+            "Referer": "https://platform.xiaomimimo.com/#/console/balance", "User-Agent": QwenProvider.browserAgent,
+        ]
+        let balance = try await HTTP.get(URL(string: "\(Self.base)/balance")!, headers: headers).requireOK()
+        let detail = try? await HTTP.get(URL(string: "\(Self.base)/tokenPlan/detail")!, headers: headers)
+        let usage = try? await HTTP.get(URL(string: "\(Self.base)/tokenPlan/usage")!, headers: headers)
+        return try Self.parse(balance: balance.data, detail: detail?.data, usage: usage?.data)
+    }
+
+    public static func parse(balance: Data, detail: Data?, usage: Data?) throws -> UsageSnapshot {
+        guard let body = ProviderJSON.object(balance) as? [String: Any] else { throw ProviderError.badResponse }
+        let code = QwenProvider.number(body["code"]) ?? 0
+        if code == 401 || code == 403 { throw ProviderError.unauthorized }
+        guard code == 0, let data = body["data"] as? [String: Any], let amount = QwenProvider.number(data["balance"]) else {
+            throw ProviderError.badResponse
+        }
+        let currency = (data["currency"] as? String)?.uppercased() == "USD" ? "$" : "¥"
+        var windows: [UsageWindow] = []
+        var plan: String?
+        if let detailBody = detail.flatMap(ProviderJSON.object) as? [String: Any], let info = detailBody["data"] as? [String: Any] {
+            plan = ProviderJSON.string(info["planCode"])
+            if (info["expired"] as? Bool) == true { plan = plan.map { L10n.t("\($0) (expired)", "\($0)（已过期）") } }
+        }
+        if let usageBody = usage.flatMap(ProviderJSON.object) as? [String: Any],
+           let month = (usageBody["data"] as? [String: Any])?["monthUsage"] as? [String: Any],
+           let item = (month["items"] as? [[String: Any]])?.first,
+           let limit = QwenProvider.number(item["limit"]), limit > 0
+        {
+            let used = QwenProvider.number(item["used"])
+            windows.append(UsageWindow(
+                title: L10n.t("Token Plan · month", "Token Plan · 本月"),
+                usedPercent: used.flatMap { ProviderJSON.percent(used: $0, total: limit) },
+                detail: used.map { "\(QuotaFormat.compact(Int($0))) / \(QuotaFormat.compact(Int(limit)))" },
+                windowSeconds: 2_592_000))
+        }
+        let balanceWindow = UsageWindow(
+            title: L10n.t("Account balance", "账户余额"),
+            detail: L10n.t("Balance \(currency)\(String(format: "%.2f", amount))", "余额 \(currency)\(String(format: "%.2f", amount))"))
+        windows.append(balanceWindow)
+        // The Token Plan above is a real monthly allowance and keeps its bar;
+        // only the balance becomes a sheet.
+        let gift = QwenProvider.number(data["giftBalance"]) ?? 0
+        return UsageSnapshot(
+            planName: plan,
+            windows: windows,
+            balance: BalanceSheet(
+                balances: [AccountBalance(
+                    currency: currency == "$" ? "USD" : "CNY",
+                    total: amount,
+                    paid: QwenProvider.number(data["cashBalance"]),
+                    granted: gift > 0 ? gift : nil)],
+                representedWindowIDs: [balanceWindow.id]))
+    }
+}
+
+// MARK: - Qoder
+
+/// Qoder's big-model credits, by cookie from qoder.com or qoder.com.cn.
+public struct QoderProvider: QuotaProvider {
+    public let id = ProviderID.qoder
+
+    public func isConfigured(config: ConfigStore) -> Bool { config.credential(for: id) != nil }
+
+    public func fetch(config: ConfigStore) async throws -> UsageSnapshot {
+        let cookie = try QwenProvider.cookieHeader(config.credential(for: id), for: id)
+        var lastError: Error = ProviderError.unauthorized
+        for site in ["qoder.com.cn", "qoder.com"] {
+            let origin = "https://\(site)"
+            do {
+                let response = try await HTTP.get(URL(string: "\(origin)/api/v2/me/usages/big_model_credits")!, headers: [
+                    "Cookie": cookie, "Origin": origin, "Referer": "\(origin)/account/usage",
+                    "X-Requested-With": "XMLHttpRequest", "Bx-V": "2.5.35", "Accept": "application/json",
+                    "User-Agent": QwenProvider.browserAgent,
+                ]).requireOK()
+                return try Self.parse(response.data)
+            } catch {
+                lastError = error
+            }
+        }
+        throw lastError
+    }
+
+    /// One bucket of credits as the reply describes it.
+    struct Bucket {
+        var used: Double?
+        var limit: Double
+        /// The percentage the console itself reports, where it does.
+        var percent: Double?
+    }
+
+    public static func parse(_ data: Data) throws -> UsageSnapshot {
+        guard let root = ProviderJSON.object(data) as? [String: Any] else { throw ProviderError.badResponse }
+        let buckets = Self.buckets(in: root)
+        // A bucket with no allowance is left out. A seat plan of 0 / 0 beside
+        // the organisation's shared pack — the console shows both — carried
+        // "usagePercentage": 100, and reading that one bucket reported a full
+        // quota for an account with credits to spare (a 0.5.10 report).
+        let counted = buckets.filter { $0.limit > 0 }
+        guard !counted.isEmpty else {
+            throw ProviderError.noPlan(L10n.t(
+                "Signed in, but this account has no Qoder credits to read.",
+                "已登录，但这个账号没有可读的 Qoder 额度。"))
+        }
+        let knownUsed = counted.map { bucket in
+            bucket.used ?? bucket.percent.map { $0 / 100 * bucket.limit }
+        }
+        let used: Double? = knownUsed.allSatisfy { $0 != nil } ? knownUsed.compactMap { $0 }.reduce(0, +) : nil
+        let limit = counted.reduce(0) { $0 + $1.limit }
+        // One bucket answers with the console's own percentage; several are
+        // one pool between them, so they are summed.
+        let percent = counted.count == 1
+            ? (counted[0].percent ?? used.flatMap { ProviderJSON.percent(used: $0, total: limit) })
+            : used.flatMap { ProviderJSON.percent(used: $0, total: limit) }
+        return UsageSnapshot(windows: [UsageWindow(
+            title: L10n.t("Credits", "额度"),
+            usedPercent: percent.map { min(max($0, 0), 100) },
+            detail: used.map { L10n.t("\(Int($0)) / \(Int(limit)) credits", "\(Int($0)) / \(Int(limit)) 点") },
+            resetsAt: QwenProvider.date(root["nextResetAt"] ?? root["next_reset_at"]))])
+    }
+
+    /// Every quota bucket in the reply, whatever it is called and however
+    /// deep it sits: the subscription seat (`totalQuota`), the shared pack
+    /// (`sharedQuota`), and any the console adds later — each is an object
+    /// carrying a `quotaSummary`.
+    static func buckets(in object: [String: Any], depth: Int = 0) -> [Bucket] {
+        guard depth < 4 else { return [] }
+        var found: [Bucket] = []
+        for key in object.keys.sorted() {
+            guard let child = object[key] as? [String: Any] else { continue }
+            if let summary = (child["quotaSummary"] ?? child["quota_summary"]) as? [String: Any] {
+                found.append(Bucket(
+                    used: QwenProvider.number(summary["usedValue"] ?? summary["used_value"]),
+                    limit: QwenProvider.number(summary["limitValue"] ?? summary["limit_value"]) ?? 0,
+                    percent: QwenProvider.number(summary["usagePercentage"] ?? summary["usage_percentage"])))
+            } else {
+                found.append(contentsOf: buckets(in: child, depth: depth + 1))
+            }
+        }
+        return found
+    }
+}
+
+// MARK: - Windsurf
+
+/// Windsurf's plan, read from the cache the editor keeps of it on this Mac.
+public struct WindsurfProvider: QuotaProvider {
+    public let id = ProviderID.windsurf
+
+    static var database: String {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/Windsurf/User/globalStorage/state.vscdb").path
+    }
+
+    public func isConfigured(config: ConfigStore) -> Bool { FileManager.default.fileExists(atPath: Self.database) }
+
+    public func fetch(config: ConfigStore) async throws -> UsageSnapshot {
+        let rows = SQLiteRead.rows(inFile: Self.database, query: "SELECT value FROM ItemTable WHERE key = 'windsurf.settings.cachedPlanInfo' LIMIT 1;")
+        guard let json = rows.first?.first ?? nil else { throw ProviderError.notConfigured(hint: id.setupHint) }
+        return try Self.parse(Data(json.utf8))
+    }
+
+    public static func parse(_ data: Data) throws -> UsageSnapshot {
+        guard let root = ProviderJSON.object(data) as? [String: Any] else { throw ProviderError.badResponse }
+        var windows: [UsageWindow] = []
+        if let quota = root["quotaUsage"] as? [String: Any] {
+            if let daily = QwenProvider.number(quota["dailyRemainingPercent"]) {
+                windows.append(UsageWindow(title: L10n.t("Daily", "每日"), usedPercent: min(max(100 - daily, 0), 100),
+                                           resetsAt: QwenProvider.date(quota["dailyResetAtUnix"]), windowSeconds: 86_400))
+            }
+            if let weekly = QwenProvider.number(quota["weeklyRemainingPercent"]) {
+                windows.append(UsageWindow(title: L10n.t("Weekly", "每周"), usedPercent: min(max(100 - weekly, 0), 100),
+                                           resetsAt: QwenProvider.date(quota["weeklyResetAtUnix"]), windowSeconds: 604_800))
+            }
+        }
+        let end = QwenProvider.date(root["endTimestamp"])
+        if let usage = root["usage"] as? [String: Any] {
+            for (title, total, used, remaining) in [
+                (L10n.t("Prompt credits", "提示额度"), "messages", "usedMessages", "remainingMessages"),
+                (L10n.t("Flow actions", "Flow 操作"), "flowActions", "usedFlowActions", "remainingFlowActions"),
+                (L10n.t("Flex credits", "弹性额度"), "flexCredits", "usedFlexCredits", "remainingFlexCredits"),
+            ] {
+                guard let totalValue = QwenProvider.number(usage[total]), totalValue > 0 else { continue }
+                let usedValue = QwenProvider.number(usage[used])
+                    ?? QwenProvider.number(usage[remaining]).map { totalValue - $0 }
+                windows.append(UsageWindow(
+                    title: title,
+                    usedPercent: usedValue.flatMap { ProviderJSON.percent(used: $0, total: totalValue) },
+                    detail: usedValue.map { "\(Int($0)) / \(Int(totalValue))" },
+                    resetsAt: end))
+            }
+        }
+        guard !windows.isEmpty else { throw ProviderError.badResponse }
+        return UsageSnapshot(planName: ProviderJSON.string(root["planName"]), windows: windows)
+    }
+}
+
+// MARK: - Kiro
+
+/// Kiro's monthly credits, asked of AWS with the session `kiro-cli` keeps on
+/// this Mac.
+public struct KiroProvider: QuotaProvider {
+    public let id = ProviderID.kiro
+
+    static var database: String {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/kiro-cli/data.sqlite3").path
+    }
+
+    public func isConfigured(config: ConfigStore) -> Bool { FileManager.default.fileExists(atPath: Self.database) }
+
+    public func fetch(config: ConfigStore) async throws -> UsageSnapshot {
+        guard let profileJSON = SQLiteRead.rows(inFile: Self.database, query: "SELECT value FROM state WHERE key = 'api.codewhisperer.profile'",immutable:false).first?.first ?? nil,
+              let arn = (ProviderJSON.object(Data(profileJSON.utf8)) as? [String: Any])?["arn"] as? String
+        else { throw ProviderError.notConfigured(hint: id.setupHint) }
+        let parts = arn.split(separator: ":", maxSplits: 5, omittingEmptySubsequences: false)
+        let endpoints = ["us-east-1": "https://codewhisperer.us-east-1.amazonaws.com/", "eu-central-1": "https://q.eu-central-1.amazonaws.com/"]
+        guard parts.count == 6, let endpoint = endpoints[String(parts[3])], let url = URL(string: endpoint) else {
+            throw ProviderError.badResponse
+        }
+        let body = String(decoding: try JSONSerialization.data(withJSONObject: ["profileArn": arn]), as: UTF8.self)
+        for attempt in 0..<2 {
+        let token = try await KiroSession.shared.token(database:Self.database,force:attempt>0)
+        let response = try await HTTP.post(url, headers: [
+            "Content-Type": "application/x-amz-json-1.0",
+            "X-Amz-Target": "AmazonCodeWhispererService.GetUsageLimits",
+            "Authorization": "Bearer \(token)",
+        ], jsonBody: body)
+        if attempt == 0,response.status == 401 || response.status == 403 {continue}
+        return try Self.parse(response.requireOK().data)
+        }
+        throw ProviderError.unauthorized
+    }
+
+    public static func parse(_ data: Data) throws -> UsageSnapshot {
+        guard let root = ProviderJSON.object(data) as? [String: Any],
+              let credit = (root["usageBreakdownList"] as? [[String: Any]])?.first(where: { ($0["resourceType"] as? String) == "CREDIT" })
+        else { throw ProviderError.badResponse }
+        let limit = QwenProvider.number(credit["usageLimitWithPrecision"]) ?? 0
+        let used = QwenProvider.number(credit["currentUsageWithPrecision"])
+        guard limit > 0 else { throw ProviderError.badResponse }
+        let reset = QwenProvider.date(credit["nextDateReset"] ?? root["nextDateReset"])
+        return UsageSnapshot(windows: [UsageWindow(
+            title: L10n.t("Monthly credits", "每月额度"),
+            usedPercent: used.flatMap { ProviderJSON.percent(used: $0, total: limit) },
+            detail: used.map { L10n.t("\(String(format: "%.1f", $0)) / \(String(format: "%.0f", limit)) credits", "\(String(format: "%.1f", $0)) / \(String(format: "%.0f", limit)) 点") },
+            resetsAt: reset)])
+    }
+}

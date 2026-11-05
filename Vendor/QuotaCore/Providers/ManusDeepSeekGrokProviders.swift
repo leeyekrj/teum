@@ -1,0 +1,785 @@
+import Foundation
+
+// MARK: - Manus (session token → api.manus.im GetAvailableCredits)
+
+public struct ManusProvider: QuotaProvider {
+    public let id = ProviderID.manus
+
+    public func isConfigured(config: ConfigStore) -> Bool {
+        config.credential(for: .manus) != nil
+    }
+
+    public func fetch(config: ConfigStore) async throws -> UsageSnapshot {
+        guard let token = config.credential(for: .manus) else {
+            throw ProviderError.notConfigured(hint: ProviderID.manus.setupHint)
+        }
+        let url = URL(string: "https://api.manus.im/user.v1.UserService/GetAvailableCredits")!
+        let response = try await HTTP.post(url, headers: [
+            "Authorization": "Bearer \(token)",
+            "Origin": "https://manus.im",
+            "Referer": "https://manus.im/",
+            "Connect-Protocol-Version": "1",
+        ]).requireOK()
+
+        struct Body: Decodable {
+            let totalCredits: Double?
+            let refreshCredits: Double?
+            let maxRefreshCredits: Double?
+            let periodicCredits: Double?
+            let addonCredits: Double?
+            let nextRefreshTime: String?
+        }
+
+        let body = try response.json(Body.self)
+        var windows: [UsageWindow] = []
+        if let max = body.maxRefreshCredits, max > 0, let refresh = body.refreshCredits {
+            windows.append(UsageWindow(
+                title: L10n.t("Daily credits", "每日额度"),
+                usedPercent: (1 - refresh / max) * 100,
+                detail: L10n.t("\(Int(refresh)) / \(Int(max)) credits", "\(Int(refresh)) / \(Int(max)) 点"),
+                resetsAt: Dates.parseAny(body.nextRefreshTime)))
+        }
+        if let total = body.totalCredits {
+            let periodic = body.periodicCredits ?? 0
+            let addon = body.addonCredits ?? 0
+            windows.append(UsageWindow(
+                title: L10n.t("Total balance", "总余额"),
+                detail: L10n.t(
+                    "\(Int(total)) credits (\(Int(periodic)) plan + \(Int(addon)) add-on)",
+                    "\(Int(total)) 点（套餐 \(Int(periodic)) + 加购 \(Int(addon))）")))
+        }
+        guard !windows.isEmpty else { throw ProviderError.badResponse }
+        return UsageSnapshot(windows: windows)
+    }
+}
+
+// MARK: - DeepSeek (API key → api.deepseek.com/user/balance)
+
+public struct DeepSeekProvider: QuotaProvider {
+    public let id = ProviderID.deepseek
+
+    public func isConfigured(config: ConfigStore) -> Bool {
+        config.credential(for: .deepseek) != nil
+    }
+
+    public func fetch(config: ConfigStore) async throws -> UsageSnapshot {
+        guard let raw = config.credential(for: .deepseek) else {
+            throw ProviderError.notConfigured(hint: ProviderID.deepseek.setupHint)
+        }
+        switch Self.credential(raw) {
+        case let .apiKey(key):
+            let url = URL(string: "https://api.deepseek.com/user/balance")!
+            let response = try await HTTP.get(url, headers: [
+                "Authorization": "Bearer \(key)",
+                "Accept": "application/json",
+            ]).requireOK()
+            return try Self.parse(response.data)
+        case let .consoleToken(token):
+            return try await Self.fetchConsole(token: token)
+        }
+    }
+
+    enum Credential: Equatable {
+        case apiKey(String)
+        case consoleToken(String)
+    }
+
+    /// One field takes either. An API key (`sk-…`) can only ask for the
+    /// balance; each key's usage is behind the platform console's own sign-in,
+    /// the `userToken` it keeps in local storage. That value is sometimes
+    /// copied as the JSON it is stored in, or with its `Bearer` prefix.
+    static func credential(_ raw: String) -> Credential {
+        var value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if value.lowercased().hasPrefix("bearer ") { value = String(value.dropFirst(7)).trimmingCharacters(in: .whitespaces) }
+        if value.hasPrefix("{"), let object = ProviderJSON.object(Data(value.utf8)) as? [String: Any],
+           let inner = ProviderJSON.string(object["value"])
+        {
+            value = inner
+        }
+        value = value.trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+        return value.hasPrefix("sk-") ? .apiKey(value) : .consoleToken(value)
+    }
+
+    // MARK: Console
+
+    static let console = "https://platform.deepseek.com/api/v0"
+
+    /// The console's own reads, as its usage page makes them:
+    ///
+    /// - the wallets, and everything ever spent (`total_costs`);
+    /// - the keys, with the names given them on DeepSeek;
+    /// - cost and requests per key per model per day over the last thirty
+    ///   days — as long a range as the per-key endpoints accept is 31 days;
+    /// - today's cost hour by hour, for today's chart;
+    /// - a month at a time for the chart of all of it, from the month the
+    ///   oldest key was made. A month that is over never changes, so months
+    ///   already read are carried over from the last reading and only the
+    ///   current one — and at most a few missing ones — are asked for.
+    static func fetchConsole(token: String, now: Date = .now, calendar: Calendar = .current) async throws -> UsageSnapshot {
+        let headers = [
+            "Authorization": "Bearer \(token)",
+            "Accept": "application/json",
+            "Origin": "https://platform.deepseek.com",
+            "Referer": "https://platform.deepseek.com/usage",
+            "User-Agent": QwenProvider.browserAgent,
+        ]
+        func get(_ path: String) async -> Data? {
+            try? await HTTP.get(URL(string: "\(console)/\(path)")!, headers: headers).requireOK().data
+        }
+        let summary = try await HTTP.get(URL(string: "\(console)/users/get_user_summary")!, headers: headers).requireOK()
+        let range = ConsoleRange(now: now, calendar: calendar)
+        let tz = calendar.timeZone.secondsFromGMT(for: now)
+        let recent = "start=\(Int(range.start.timeIntervalSince1970))&end=\(Int(range.end.timeIntervalSince1970))&tz=\(tz)"
+        let day = "start=\(Int(range.today.timeIntervalSince1970))&end=\(Int(range.end.timeIntervalSince1970))&tz=\(tz)"
+        let keys = await get("users/get_api_keys")
+        let cost = await get("usage/by_api_key/cost?\(recent)")
+        let amount = await get("usage/by_api_key/amount?\(recent)")
+        let hourly = await get("usage/by_api_key/cost?\(day)")
+
+        // Months for the all-time chart.
+        let firstKey = keys.flatMap { try? consoleData($0) }.flatMap { $0["api_keys"] as? [[String: Any]] }?
+            .compactMap { QwenProvider.date($0["created_at"]) }.min()
+        let cached = SnapshotCache.shared.snapshot(for: .deepseek)?.balance?.chart[.all] ?? []
+        var months: [UsageBucket] = []
+        var asked = 0
+        for start in UsageBuckets.starts(for: .all, now: now, first: firstKey ?? range.month, calendar: calendar).suffix(24) {
+            let current = start == range.month
+            if !current, let known = cached.first(where: { $0.start == start }) {
+                months.append(known)
+                continue
+            }
+            // A handful a refresh: the console turns away a burst.
+            guard current || asked < 3 else { continue }
+            asked += 1
+            let parts = calendar.dateComponents([.year, .month], from: start)
+            if let data = await get("usage/cost?month=\(parts.month ?? 1)&year=\(parts.year ?? 1970)"),
+               let bucket = monthBucket(data, start: start)
+            {
+                months.append(bucket)
+            }
+        }
+        return try parseConsole(summary: summary.data, keys: keys, cost: cost, amount: amount, hourly: hourly, months: months, range: range)
+    }
+
+    struct ConsoleRange {
+        let now: Date
+        let calendar: Calendar
+        let today: Date
+        let month: Date
+        /// The first of the thirty days the per-key reads cover.
+        let start: Date
+        let end: Date
+
+        init(now: Date, calendar: Calendar) {
+            self.now = now
+            self.calendar = calendar
+            today = calendar.startOfDay(for: now)
+            month = calendar.dateInterval(of: .month, for: now)?.start ?? today
+            start = calendar.date(byAdding: .day, value: -29, to: today) ?? today
+            end = calendar.date(byAdding: .day, value: 1, to: today) ?? today.addingTimeInterval(86_400)
+        }
+
+        /// The periods ending today that a day belongs to. All of it is told
+        /// by the console's own total, not by adding up thirty days.
+        func periods(containing day: Date) -> [KeyUsagePeriod] {
+            [KeyUsagePeriod.today, .last7, .last30].filter { period in
+                UsageBuckets.periodStart(period, now: now, calendar: calendar).map { day >= $0 } ?? false
+            }
+        }
+    }
+
+    /// `{"code":0,"msg":"","data":{"biz_code":0,"biz_msg":"","biz_data":{…}}}`
+    /// — two envelopes. A missing or expired token is an outer code
+    /// (40002 "Missing Token"), a bad query an inner one.
+    static func consoleData(_ data: Data) throws -> [String: Any] {
+        guard let body = ProviderJSON.object(data) as? [String: Any] else { throw ProviderError.badResponse }
+        let code = QwenProvider.number(body["code"]) ?? 0
+        if code != 0 {
+            if (40_000..<41_000).contains(code) { throw ProviderError.unauthorized }
+            throw ProviderError.badResponse
+        }
+        guard let inner = body["data"] as? [String: Any], (QwenProvider.number(inner["biz_code"]) ?? 0) == 0,
+              let payload = inner["biz_data"] as? [String: Any]
+        else { throw ProviderError.badResponse }
+        return payload
+    }
+
+    /// `usage/cost?month=&year=`: per currency, each model's cost split by
+    /// token type (`PROMPT_CACHE_HIT_TOKEN`, `RESPONSE_TOKEN`, …). Its
+    /// `biz_data` is the array itself, not an object.
+    static func monthBucket(_ data: Data, start: Date) -> UsageBucket? {
+        guard let body = ProviderJSON.object(data) as? [String: Any], (QwenProvider.number(body["code"]) ?? 0) == 0,
+              let inner = body["data"] as? [String: Any], (QwenProvider.number(inner["biz_code"]) ?? 0) == 0,
+              let currencies = inner["biz_data"] as? [[String: Any]]
+        else { return nil }
+        var money = MoneyTally()
+        for block in currencies {
+            let currency = (ProviderJSON.string(block["currency"]) ?? "CNY").uppercased()
+            let total = (block["total"] as? [[String: Any]] ?? []).reduce(0.0) { sum, model in
+                sum + (model["usage"] as? [[String: Any]] ?? []).reduce(0.0) { $0 + (QwenProvider.number($1["amount"]) ?? 0) }
+            }
+            if total > 0 { money.add(currency, total) }
+        }
+        return UsageBucket(start: start, costs: money.money)
+    }
+
+    static func parseConsole(
+        summary: Data, keys: Data?, cost: Data?, amount: Data?, hourly: Data? = nil, months: [UsageBucket] = [],
+        range: ConsoleRange) throws -> UsageSnapshot
+    {
+        let calendar = range.calendar
+        let wallets = try consoleData(summary)
+        func amounts(_ list: Any?, _ field: String) -> [(currency: String, value: Double)] {
+            (list as? [[String: Any]] ?? []).compactMap { entry in
+                guard let currency = ProviderJSON.string(entry["currency"]), let value = QwenProvider.number(entry[field]) else { return nil }
+                return (currency.uppercased(), value)
+            }
+        }
+        let normal = amounts(wallets["normal_wallets"], "balance")
+        let bonus = amounts(wallets["bonus_wallets"], "balance")
+        var currencies: [String] = []
+        for entry in normal + bonus where !currencies.contains(entry.currency) { currencies.append(entry.currency) }
+        var balances = currencies.map { currency -> AccountBalance in
+            let paid = normal.filter { $0.currency == currency }.reduce(0) { $0 + $1.value }
+            let granted = bonus.filter { $0.currency == currency }.reduce(0) { $0 + $1.value }
+            return AccountBalance(currency: currency, total: paid + granted, paid: paid, granted: granted > 0 ? granted : nil)
+        }
+        // A wallet the account has never used is listed at zero; show it only
+        // when it is all there is.
+        if balances.contains(where: { $0.total > 0 }) { balances.removeAll { $0.total <= 0 } }
+        if balances.isEmpty { balances = [AccountBalance(currency: "CNY", total: 0)] }
+
+        var usage: [KeyUsagePeriod: KeyUsageFigures] = [:]
+        var chart: [KeyUsagePeriod: [UsageBucket]] = [:]
+        // `total_costs` is everything the account has spent, not this month:
+        // on the owner's account it was ¥592.74 against ¥36.79 for September.
+        let lifetime = amounts(wallets["total_costs"], "amount").filter { $0.value > 0 }
+        usage[.all] = KeyUsageFigures(costs: lifetime.map { Money(currency: $0.currency, amount: $0.value) })
+        if !months.isEmpty { chart[.all] = months.sorted { $0.start < $1.start } }
+
+        var keyList: [APIKeyUsage]?
+        var note: String?
+        if let listed = keys.flatMap({ try? consoleData($0) }), let entries = listed["api_keys"] as? [[String: Any]] {
+            keyList = entries.compactMap { entry in
+                guard let id = ProviderJSON.string(entry["tracking_id"]) else { return nil }
+                return APIKeyUsage(
+                    id: id,
+                    name: ProviderJSON.string(entry["name"]) ?? L10n.t("Unnamed key", "未命名 Key"),
+                    maskedKey: ProviderJSON.string(entry["sensitive_id"]),
+                    lastUsed: (QwenProvider.number(entry["last_use"]) ?? 0) > 0 ? QwenProvider.date(entry["last_use"]) : nil)
+            }
+        }
+
+        let costs = cost.flatMap { try? consoleData($0) }
+        let counts = amount.flatMap { try? consoleData($0) }
+        if costs == nil && counts == nil {
+            note = L10n.t("Couldn't read the recent usage this time.", "这次没能读到最近的用量。")
+        } else {
+            var byID: [String: APIKeyUsage] = [:]
+            var order: [String] = []
+            for key in keyList ?? [] {
+                byID[key.id] = key
+                order.append(key.id)
+            }
+            // A deleted key keeps its history in the usage replies and nowhere else.
+            func key(_ raw: Any?) -> String? {
+                guard let info = raw as? [String: Any], let id = ProviderJSON.string(info["tracking_id"]) else { return nil }
+                if byID[id] == nil {
+                    byID[id] = APIKeyUsage(
+                        id: id,
+                        name: ProviderJSON.string(info["name"]) ?? L10n.t("Deleted key", "已删除的 Key"),
+                        maskedKey: ProviderJSON.string(info["sensitive_id"]),
+                        isDisabled: (info["valid"] as? Bool) == false)
+                    order.append(id)
+                }
+                return id
+            }
+            // Every non-zero bucket of both replies, as (key, model, entry).
+            var events: [(key: String, model: String, entry: UsageBuckets.Entry)] = []
+            for block in costs?["data"] as? [[String: Any]] ?? [] {
+                let currency = (ProviderJSON.string(block["currency"]) ?? "CNY").uppercased()
+                for series in block["series"] as? [[String: Any]] ?? [] {
+                    guard let id = key(series["api_key"]) else { continue }
+                    let model = ProviderJSON.string(series["model"]) ?? "—"
+                    for bucket in series["buckets"] as? [[String: Any]] ?? [] {
+                        guard let time = QwenProvider.number(bucket["time"]), let value = QwenProvider.number(bucket["cost"]), value > 0 else { continue }
+                        events.append((id, model, UsageBuckets.Entry(date: Date(timeIntervalSince1970: time), currency: currency, cost: value)))
+                    }
+                }
+            }
+            let known = counts != nil
+            for series in counts?["series"] as? [[String: Any]] ?? [] {
+                guard let id = key(series["api_key"]) else { continue }
+                let model = ProviderJSON.string(series["model"]) ?? "—"
+                for bucket in series["buckets"] as? [[String: Any]] ?? [] {
+                    guard let time = QwenProvider.number(bucket["time"]), let figures = bucket["usage"] as? [String: Any] else { continue }
+                    let asked = Int(QwenProvider.number(figures["REQUEST"]) ?? 0)
+                    let used = ["RESPONSE_TOKEN", "PROMPT_CACHE_HIT_TOKEN", "PROMPT_CACHE_MISS_TOKEN"]
+                        .reduce(0) { $0 + Int(QwenProvider.number(figures[$1]) ?? 0) }
+                    guard asked > 0 || used > 0 else { continue }
+                    events.append((id, model, UsageBuckets.Entry(date: Date(timeIntervalSince1970: time), currency: "", cost: 0, requests: asked, tokens: used)))
+                }
+            }
+
+            func models(_ rows: [(key: String, model: String, entry: UsageBuckets.Entry)]) -> [ModelCost] {
+                Dictionary(grouping: rows, by: \.model).map { name, rows in
+                    let figures = UsageBuckets.figures(rows.map(\.entry), since: nil)
+                    return ModelCost(model: name, costs: figures.costs, requests: known ? figures.requests ?? 0 : nil, tokens: known ? figures.tokens ?? 0 : nil)
+                }
+                .sorted(by: ModelCost.busiestFirst)
+            }
+            func figures(_ rows: [(key: String, model: String, entry: UsageBuckets.Entry)]) -> KeyUsageFigures {
+                var total = UsageBuckets.figures(rows.map(\.entry), since: nil, models: models(rows))
+                if known { total.requests = total.requests ?? 0; total.tokens = total.tokens ?? 0 } else { total.requests = nil; total.tokens = nil }
+                return total
+            }
+
+            for period in [KeyUsagePeriod.today, .last7, .last30] {
+                let inPeriod = events.filter { range.periods(containing: $0.entry.date).contains(period) }
+                usage[period] = figures(inPeriod)
+            }
+            let days = UsageBuckets.starts(for: .last30, now: range.now, first: nil, calendar: calendar)
+            chart[.last30] = UsageBuckets.fill(days, span: .day, entries: events.map(\.entry), calendar: calendar)
+            chart[.last7] = Array((chart[.last30] ?? []).suffix(7))
+
+            keyList = order.compactMap { id in
+                guard var entry = byID[id] else { return nil }
+                let mine = events.filter { $0.key == id }
+                for period in [KeyUsagePeriod.today, .last7, .last30] {
+                    let figures = figures(mine.filter { range.periods(containing: $0.entry.date).contains(period) })
+                    if !figures.isEmpty { entry.usage[period] = figures }
+                }
+                if !entry.usage.isEmpty {
+                    entry.daily = UsageBuckets.fill(days, span: .day, entries: mine.map(\.entry), calendar: calendar)
+                }
+                // A deleted key with nothing in range is not worth a row.
+                return entry.isDisabled && entry.usage.isEmpty ? nil : entry
+            }
+        }
+
+        // Today by the hour, from its own read; the daily figures above
+        // already count today, so this is for the chart only.
+        if let hours = hourly.flatMap({ try? consoleData($0) }) {
+            var entries: [UsageBuckets.Entry] = []
+            for block in hours["data"] as? [[String: Any]] ?? [] {
+                let currency = (ProviderJSON.string(block["currency"]) ?? "CNY").uppercased()
+                for series in block["series"] as? [[String: Any]] ?? [] {
+                    for bucket in series["buckets"] as? [[String: Any]] ?? [] {
+                        guard let time = QwenProvider.number(bucket["time"]), let value = QwenProvider.number(bucket["cost"]), value > 0 else { continue }
+                        entries.append(UsageBuckets.Entry(date: Date(timeIntervalSince1970: time), currency: currency, cost: value))
+                    }
+                }
+            }
+            chart[.today] = UsageBuckets.fill(
+                UsageBuckets.starts(for: .today, now: range.now, first: nil, calendar: calendar),
+                span: .hour, entries: entries, calendar: calendar)
+        }
+
+        let windows = balanceWindows(balances, canCallAPI: nil)
+        return UsageSnapshot(
+            planName: L10n.t("Pay as you go", "按量付费"),
+            windows: windows,
+            balance: BalanceSheet(
+                balances: balances,
+                usage: usage,
+                chart: chart,
+                keys: keyList,
+                keysNote: note,
+                representedWindowIDs: windows.map(\.id)))
+    }
+
+    /// The figure-only windows a balance is also reported as, for the local
+    /// API and the surfaces that only read windows.
+    static func balanceWindows(_ balances: [AccountBalance], canCallAPI: Bool?) -> [UsageWindow] {
+        balances.map { entry in
+            var detail = L10n.t(
+                "Balance \(QuotaFormat.amount(entry.total, code: entry.currency))",
+                "余额 \(QuotaFormat.amount(entry.total, code: entry.currency))")
+            if let granted = entry.granted, granted > 0 {
+                let paid = QuotaFormat.amount(entry.paid ?? entry.total - granted, code: entry.currency)
+                let gift = QuotaFormat.amount(granted, code: entry.currency)
+                detail += L10n.t(" · \(paid) paid + \(gift) granted", " · 充值 \(paid) + 赠送 \(gift)")
+            }
+            if canCallAPI == false {
+                detail += L10n.t(" · not enough for API calls", " · 余额不足，无法调用 API")
+            }
+            // `UsageWindow.id` is the title, so a second currency needs its own.
+            let title = balances.count > 1 ? "\(L10n.t("Balance", "余额")) · \(entry.currency)" : L10n.t("Balance", "余额")
+            return UsageWindow(title: title, detail: detail)
+        }
+    }
+
+    /// `{"is_available":true,"balance_infos":[{"currency":"CNY","total_balance":"110.00",
+    /// "granted_balance":"10.00","topped_up_balance":"100.00"}]}` — snake_case,
+    /// amounts as strings. The keys were once read camel-cased, so every
+    /// account failed to parse. An account can hold CNY and USD side by side,
+    /// and a new one with nothing topped up may list no entry at all.
+    static func parse(_ data: Data) throws -> UsageSnapshot {
+        guard let body = ProviderJSON.object(data) as? [String: Any],
+              let infos = body["balance_infos"] as? [[String: Any]]
+        else { throw ProviderError.badResponse }
+
+        let canCall = body["is_available"] as? Bool
+        var balances = infos.compactMap { info -> AccountBalance? in
+            guard let total = QwenProvider.number(info["total_balance"]) else { return nil }
+            let granted = QwenProvider.number(info["granted_balance"]) ?? 0
+            return AccountBalance(
+                currency: ((info["currency"] as? String) ?? "CNY").uppercased(),
+                total: total,
+                paid: QwenProvider.number(info["topped_up_balance"]),
+                granted: granted > 0 ? granted : nil)
+        }
+        if !infos.isEmpty, balances.isEmpty { throw ProviderError.badResponse }
+        if balances.isEmpty { balances = [AccountBalance(currency: "CNY", total: 0)] }
+
+        let windows = balanceWindows(balances, canCallAPI: canCall)
+        return UsageSnapshot(
+            planName: L10n.t("Pay as you go", "按量付费"),
+            windows: windows,
+            balance: BalanceSheet(
+                balances: balances,
+                canCallAPI: canCall,
+                representedWindowIDs: windows.map(\.id)))
+    }
+}
+
+// MARK: - Grok (grok CLI auth file or manual token → cli-chat-proxy billing; Grok Bot when SuperGrok pays for it)
+
+public struct GrokProvider: QuotaProvider {
+    public let id = ProviderID.grok
+    private let allowCredentialRenewal: Bool
+    private let cursorCardIsShown: Bool?
+    public init(allowCredentialRenewal: Bool = true, cursorCardIsShown: Bool? = nil) {
+        self.allowCredentialRenewal = allowCredentialRenewal
+        self.cursorCardIsShown = cursorCardIsShown
+    }
+
+    public func isConfigured(config: ConfigStore) -> Bool {
+        config.credential(for: .grok) != nil || LocalCredentials.grokAccessToken() != nil
+            || GrokBot.isSignedIn()
+    }
+
+    public func fetch(config: ConfigStore) async throws -> UsageSnapshot {
+        var local = LocalCredentials.grokAuth()
+        // A migrated Cursor sign-in can read the whole shared pool directly.
+        // Use it here only when its server-issued xAI workspace/seat exactly
+        // matches this CLI credential's own authenticated principal. Emails
+        // and coincident reset dates are deliberately not compared.
+        if config.credential(for: .grok) == nil,
+           let local, let identity = XSubscriptionClient.grokIdentity(local)
+        {
+            let editor = try? CursorProvider().cookieHeader(config)
+            let bot = GrokBot.lookup(interactive: false).session?.cookieHeader
+            var cookies: [String] = []
+            for cookie in [editor, bot].compactMap({ $0 }) where !cookies.contains(cookie) { cookies.append(cookie) }
+            for cookie in cookies {
+                let shared = await XSubscriptionClient.read(cookie: cookie, account: local.email)
+                if let snapshot = shared.snapshot, snapshot.xSubscription?.verifiedIdentity == identity {
+                    return snapshot
+                }
+                if shared.migrationUnavailable,
+                   SnapshotCache.shared.snapshot(for: .grok)?.xSubscription?.verifiedIdentity == identity {
+                    throw ProviderError.network(L10n.t(
+                        "The shared subscription could not be checked this time.",
+                        "这次暂时无法确认共享订阅。"))
+                }
+            }
+        }
+        // Run out after six hours away from the grok CLI: have it renew.
+        var renewal: CLIRenewal.Outcome?
+        if allowCredentialRenewal, config.credential(for: .grok) == nil, let expiry = local?.expiresAt,
+           expiry <= Date().addingTimeInterval(60)
+        {
+            renewal = await GrokCLIRenewal.renewIfExpired()
+            if renewal == .renewed { local = LocalCredentials.grokAuth() }
+        }
+        let cursorCardShown = cursorCardIsShown ?? (config.isEnabled(.cursor) && CursorProvider().isConfigured(config: config))
+        let bot = Task { try await GrokBot.readingForGrokCard(cursorCardShown: cursorCardShown) }
+        guard let token = config.credential(for: .grok) ?? local?.accessToken else {
+            // No xAI sign-in: Grok Bot is all there is to show.
+            return try Self.botOnly(await bot.value)
+        }
+        var snapshot: UsageSnapshot
+        do {
+            snapshot = try await Self.credits(token: token, email: local?.email)
+        } catch let error as ProviderError where Self.hasNoQuota(error) {
+            return try Self.withoutCredits(error, bot: try? await bot.value)
+        } catch ProviderError.unauthorized where config.credential(for: .grok) == nil && local != nil {
+            throw ProviderError.sessionExpired(Self.expiredMessage(renewal))
+        }
+        if snapshot.planName == nil, config.credential(for: .grok) == nil { snapshot.planName = LocalCredentials.grokPlanName() }
+        // Beside the credits, Grok Bot is best effort: its sign-in failing
+        // must not cost the card what it showed before.
+        if case let .row(window, _, _)? = try? await bot.value {
+            snapshot.windows.append(window)
+        }
+        return snapshot
+    }
+
+    /// The CLI's sign-in run out and not renewed: said as it is. Running the
+    /// CLI once renews it; signing in again is not needed.
+    static func expiredMessage(_ renewal: CLIRenewal.Outcome?) -> String {
+        switch renewal {
+        case .noCLI?:
+            return L10n.t(
+                "The grok CLI's sign-in has run out, and QuotaBar could not find `grok` to have it renewed. Run grok once.",
+                "grok CLI 的登录已过期，QuotaBar 找不到 `grok` 来让它续期。运行一次 grok 即可。")
+        case .failed?, .coolingDown?:
+            return L10n.t(
+                "The grok CLI's sign-in has run out and did not renew when QuotaBar asked; QuotaBar asks again within half an hour. Running grok once renews it too.",
+                "grok CLI 的登录已过期，QuotaBar 让它续期没有成功，半小时内会再试；运行一次 grok 也能续期。")
+        default:
+            return L10n.t(
+                "The grok CLI's sign-in has run out. Running grok once renews it; there is no need to sign in again.",
+                "grok CLI 的登录已过期。运行一次 grok 就会续期，不需要重新登录。")
+        }
+    }
+
+    static func botOnly(_ reading: GrokBot.Reading) throws -> UsageSnapshot {
+        switch reading {
+        case let .subscription(snapshot):
+            return snapshot
+        case let .row(window, plan, account):
+            return UsageSnapshot(planName: plan, account: account, windows: [window])
+        case .onCursorCard:
+            throw ProviderError.usageOnOtherProvider(provider: .cursor, hint: GrokBot.onCursorCardHint)
+        case .needsAuthorization:
+            throw ProviderError.needsAuthorization(hint: GrokBot.authorizationHint)
+        case .nothing:
+            throw ProviderError.notConfigured(hint: ProviderID.grok.setupHint)
+        }
+    }
+
+    static func hasNoQuota(_ error: ProviderError) -> Bool {
+        switch error {
+        case .noPlan, .usageUnavailable: return true
+        default: return false
+        }
+    }
+
+    static func withoutCredits(_ error: ProviderError, bot: GrokBot.Reading?) throws -> UsageSnapshot {
+        switch bot {
+        case .subscription?:
+            // A manual/CLI credential with unavailable credits must not be
+            // silently replaced by a different Bot account's shared pool.
+            throw error
+        case let .row(window, plan, account)?:
+            return UsageSnapshot(planName: plan, account: account, windows: [window])
+        case .onCursorCard?:
+            if case .usageUnavailable = error {
+                throw ProviderError.usageUnavailable(L10n.t(
+                    "Grok is signed in. Its quota data is currently unavailable because the billing response did not report a usage percentage. Grok Bot usage is available on the Cursor card.",
+                    "Grok 已登录。额度数据暂不可用：接口未返回用量百分比。Grok Bot 用量可在 Cursor 卡片查看。"))
+            }
+            throw ProviderError.usageOnOtherProvider(provider: .cursor, hint: GrokBot.onCursorCardHint)
+        default:
+            throw error
+        }
+    }
+
+    static func credits(token: String, email: String?, send: HTTPSend = HTTP.live) async throws -> UsageSnapshot {
+        let url = URL(string: "https://cli-chat-proxy.grok.com/v1/billing?format=credits")!
+        let response = try await send("GET", url, [
+            "Authorization": "Bearer \(token)",
+            "x-xai-token-auth": "xai-grok-cli",
+            "Accept": "application/json",
+            "User-Agent": "QuotaBar",
+        ], nil, 20).requireOK()
+        var snapshot = try parse(response.data)
+        // The billing response carries no identity; the CLI's auth entry does.
+        if snapshot.account == nil { snapshot.account = email }
+        return snapshot
+    }
+
+    // MARK: Response shape
+
+    struct Amount: Decodable { let val: Double? }
+    /// xAI's Cent message is USD cents. An explicit empty message is proto3
+    /// zero; an absent message or an explicit malformed scalar is unknown.
+    struct PrepaidAmount: Decodable {
+        let cents: Double?
+        private enum CodingKeys: String, CodingKey { case val }
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            if !c.contains(.val) { cents = 0 }
+            else if let value = try? c.decode(Double.self, forKey: .val), value.isFinite { cents = value }
+            else if let raw = try? c.decode(String.self, forKey: .val), let value = Double(raw), value.isFinite { cents = value }
+            else { cents = nil }
+        }
+    }
+    struct Period: Decodable {
+        let start: String?
+        let type: String?
+        let end: String?
+    }
+    struct Product: Decodable {
+        let product: String?
+        let usagePercent: Double?
+    }
+    struct Config: Decodable {
+        let creditUsagePercent: Double?
+        let isUnifiedBillingUser: Bool?
+        let monthlyLimit: Amount?
+        let used: Amount?
+        let currentPeriod: Period?
+        let billingPeriodEnd: String?
+        let onDemandCap: Amount?
+        let onDemandUsed: Amount?
+        let productUsage: [Product]?
+        let subscriptionTier: String?
+        let prepaidBalance: PrepaidAmount?
+    }
+    struct Body: Decodable {
+        let config: Config?
+        let subscriptionTier: String?
+    }
+
+    /// The period is whatever the account is on. Live accounts report
+    /// `USAGE_PERIOD_TYPE_WEEKLY`; before the type was read the window was
+    /// labelled "monthly" regardless, which was simply wrong on those. Each
+    /// `productUsage` entry (Grok Imagine, Grok Build, …) becomes a scoped
+    /// window under the same period, the way Claude's per-model windows do.
+    static func parse(_ data: Data) throws -> UsageSnapshot {
+        let body: Body
+        do { body = try JSONDecoder().decode(Body.self, from: data) } catch { throw ProviderError.badResponse }
+        guard let configBody = body.config else { throw ProviderError.badResponse }
+
+        let periodEnd = Dates.parseISO(configBody.currentPeriod?.end)
+            ?? Dates.parseISO(configBody.billingPeriodEnd)
+        let legacyPercent: Double?
+        if let limit = configBody.monthlyLimit?.val, limit > 0, let used = configBody.used {
+            // xAI's Cent messages omit a zero-valued `val` in proto3 JSON.
+            legacyPercent = (used.val ?? 0) / limit * 100
+        } else { legacyPercent = nil }
+        let (title, seconds) = periodLabel(configBody.currentPeriod?.type ?? (legacyPercent != nil ? "USAGE_PERIOD_TYPE_MONTHLY" : nil))
+
+        // Verified against this account's official Usage page: unified
+        // billing omits the scalar at 0%. Require its complete typed period,
+        // not merely a date or an empty config, before adopting that zero.
+        let reportedKeys = (ProviderJSON.object(data) as? [String: Any])?["config"] as? [String: Any]
+        let period = configBody.currentPeriod
+        let knownType = ["USAGE_PERIOD_TYPE_WEEKLY", "USAGE_PERIOD_TYPE_MONTHLY", "USAGE_PERIOD_TYPE_DAILY"].contains(period?.type ?? "")
+        let validPeriod = Dates.parseISO(period?.start).flatMap { start in
+            Dates.parseISO(period?.end).map { $0 > start }
+        } ?? false
+        let hasProductUsage = (configBody.productUsage ?? []).contains { ($0.usagePercent ?? 0) > 0 }
+        let omittedUnifiedZero = configBody.isUnifiedBillingUser == true && knownType && validPeriod &&
+            reportedKeys?["creditUsagePercent"] == nil && !hasProductUsage
+        let aggregatePercent = configBody.creditUsagePercent ?? legacyPercent ?? (omittedUnifiedZero ? 0 : nil)
+        var windows: [UsageWindow] = []
+        if let percent = aggregatePercent {
+            windows.append(UsageWindow(
+                title: title,
+                usedPercent: percent,
+                resetsAt: periodEnd,
+                windowSeconds: seconds))
+        }
+        for product in configBody.productUsage ?? [] {
+            guard let raw = product.product, let percent = product.usagePercent else { continue }
+            // The products split the one credit pool. A product holding all of
+            // it — only Grok Build used this week — is the same bar a second
+            // time: same figure, same reset (issue #2).
+            // Judged on the figure as shown, rounded: 53.4% and 53.1% draw two
+            // rows both reading "53%" with the same reset, which is what a
+            // reporter on 0.5.13 saw; only a 0.05 difference was caught before.
+            if let total = aggregatePercent,
+               Int(percent.rounded()) == Int(total.rounded()) { continue }
+            let name = productName(raw)
+            // `UsageWindow.id` is the title, so a scoped window needs its own.
+            windows.append(UsageWindow(
+                title: "\(title) · \(name)",
+                usedPercent: percent,
+                resetsAt: periodEnd,
+                windowSeconds: seconds,
+                scope: name))
+        }
+        if let cap = configBody.onDemandCap?.val, cap > 0, let used = configBody.onDemandUsed?.val {
+            windows.append(UsageWindow(
+                title: L10n.t("On-demand", "按量付费"),
+                usedPercent: used / cap * 100,
+                detail: String(format: "%.2f / %.2f", used, cap),
+                resetsAt: periodEnd))
+        }
+        // A billing period and nothing in it: signed in, on an account with
+        // no plan that carries credits. Said as it is, not as a reply that
+        // would not parse.
+        guard !windows.isEmpty else {
+            if configBody.currentPeriod != nil {
+                throw ProviderError.usageUnavailable(L10n.t(
+                    "Grok is connected, but its billing response did not include a verifiable quota. No percentage is shown.",
+                    "Grok 已登录，但接口未提供可核验的额度，暂不显示百分比。"))
+            }
+            throw ProviderError.noPlan(L10n.t(
+                "This xAI account has no Grok plan with credits to read.",
+                "这个 xAI 账号没有带额度的 Grok 套餐可读。"))
+        }
+        // The CLI reports prepaid ledger credits as signed cents. Its own
+        // display uses the magnitude as available credit (including zero).
+        let balance = configBody.prepaidBalance?.cents.map {
+            let dollars = abs($0) / 100
+            return BalanceSheet(balances: [AccountBalance(currency: "USD", total: dollars, paid: dollars)])
+        }
+        return UsageSnapshot(
+            planName: configBody.subscriptionTier ?? body.subscriptionTier,
+            windows: windows,
+            balance: balance)
+    }
+
+    /// `USAGE_PERIOD_TYPE_WEEKLY` and friends → a title and the window length
+    /// the menu-bar glyph keys its short label off.
+    static func periodLabel(_ type: String?) -> (title: String, seconds: Int?) {
+        let value = type?.uppercased() ?? ""
+        if value.contains("WEEK") { return (L10n.t("Weekly credits", "每周额度"), 7 * 86_400) }
+        // "DAILY" does not contain "DAY".
+        if value.contains("DAI") || value.contains("DAY") { return (L10n.t("Daily credits", "每日额度"), 86_400) }
+        if value.contains("MONTH") { return (L10n.t("Monthly credits", "月度额度"), 30 * 86_400) }
+        return (L10n.t("Credits", "额度"), nil)
+    }
+
+    /// `GrokImagine` → `Grok Imagine`. The API's product ids are camel-cased
+    /// brand names; the space is what the product is actually called.
+    static func productName(_ raw: String) -> String {
+        var out = ""
+        var previous: Character?
+        for ch in raw {
+            if ch.isUppercase, let previous, previous.isLowercase || previous.isNumber { out.append(" ") }
+            out.append(ch)
+            previous = ch
+        }
+        return out
+    }
+}
+
+// MARK: - Registry
+
+public enum ProviderRegistry {
+    public static func make(_ id: ProviderID) -> any QuotaProvider {
+        switch id {
+        case .codex: CodexProvider()
+        case .claude: ClaudeProvider()
+        case .cursor: CursorProvider()
+        case .kimi: KimiProvider()
+        case .zai: ZaiProvider()
+        case .opencodeGo: OpenCodeGoProvider()
+        case .minimax: MiniMaxProvider()
+        case .manus: ManusProvider()
+        case .deepseek: DeepSeekProvider()
+        case .grok: GrokProvider()
+        case .antigravity: AntigravityProvider()
+        case .qwen: QwenProvider()
+        case .alibaba: AlibabaCodingPlanProvider()
+        case .volcengine: VolcengineArkProvider()
+        case .zhipu: ZhipuProvider()
+        case .copilot: CopilotProvider()
+        case .openrouter: OpenRouterProvider()
+        case .mimo: MiMoProvider()
+        case .qoder: QoderProvider()
+        case .windsurf: WindsurfProvider()
+        case .kiro: KiroProvider()
+        }
+    }
+
+    public static var all: [any QuotaProvider] {
+        ProviderID.allCases.map(make)
+    }
+}
